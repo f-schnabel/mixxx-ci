@@ -355,6 +355,10 @@ class Monitor:
                 if key in seen:
                     continue
                 seen.add(key)
+            # GitHub sometimes leaves a job in_progress after it finished, but it
+            # still sets its conclusion and completed_at.
+            if job['conclusion'] or job['completed_at'] or run['status'] == 'completed':
+                job = {**job, 'status': 'completed', 'completed_at': job['completed_at'] or run['updated_at']}
             # GitHub fills started_at already while a job is queued; a job only
             # ran when a runner picked it up.
             ran = job['status'] == 'in_progress' or (job['status'] == 'completed' and bool(job['runner_name']))
@@ -409,12 +413,18 @@ class Monitor:
             'finished_per_hour': round(sum(1 for m in ran if m['completed'] > now - hours * 3600) / hours, 1),
         }
 
-    def history(self, hours):
+    def history(self, hours=None, window=None):
+        """Chart points for the last `hours`, or for `window` = (start, end) in seconds."""
+        key = hours if window is None else window
         with self.lock:
-            if hours in self.history_cache:
-                return self.history_cache[hours]
+            if key in self.history_cache:
+                return self.history_cache[key]
             model, now, covered = self.model or ([], time.time(), time.time())
-        start = max(now - hours * 3600, covered)
+        if window is None:
+            start = max(now - hours * 3600, covered)
+        else:
+            start, now = max(window[0], covered), min(window[1], now)
+            start = min(start, now - 60)
         step = max(60, math.ceil((now - start) / HISTORY_POINTS / 60) * 60)
         count = int((now - start) // step) + 1
         open_end = now + step  # jobs that are still queued or running count at the last sample
@@ -452,7 +462,7 @@ class Monitor:
             points.append(point)
         result = {'step': step, 'from': round(start * 1000), 'points': points}
         with self.lock:
-            self.history_cache[hours] = result
+            self.history_cache[key] = result
         return result
 
     def poll_forever(self):
@@ -498,8 +508,13 @@ def make_handler(monitor):
             elif url.path == '/api/state':
                 self.send_json(monitor.state())
             elif url.path == '/api/history':
+                query = parse_qs(url.query)
                 try:
-                    hours = float(parse_qs(url.query).get('hours', ['24'])[0])
+                    if 'from' in query and 'to' in query:
+                        window = (int(query['from'][0]) / 1000, int(query['to'][0]) / 1000)
+                        self.send_json(monitor.history(window=window))
+                        return
+                    hours = float(query.get('hours', ['24'])[0])
                 except ValueError:
                     hours = 24
                 hours = min(max(hours, 1), monitor.args.days * 24)

@@ -58,7 +58,10 @@ h1 span { color: var(--accent); }
 .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 14px 16px; }
 .panel-head { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 6px 16px; margin-bottom: 10px; }
 .panel h2 { margin: 0; font-size: 15px; font-weight: 600; }
-.chart-box { position: relative; height: 240px; }
+.chart-box { position: relative; height: 240px; cursor: crosshair; user-select: none; }
+.selection { position: absolute; top: 0; bottom: 0; background: color-mix(in srgb, var(--accent) 18%, transparent);
+  border-inline: 1px solid var(--accent); pointer-events: none; }
+.chart-foot { display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: center; justify-content: space-between; }
 .empty { color: var(--muted); font-size: 13px; padding: 8px 0; }
 
 .filters { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
@@ -119,9 +122,12 @@ footer { color: var(--muted); font-size: 12px; }
         <button class="chip-btn" data-hours="336" aria-pressed="false">14 days</button>
       </div>
     </div>
-    <div class="chart-box"><canvas id="chart" role="img" aria-label="Queued and running jobs over time"></canvas></div>
+    <div class="chart-box" id="chart-box"><canvas id="chart" role="img" aria-label="Queued and running jobs over time"></canvas><div class="selection" id="selection" hidden></div></div>
     <p class="empty" id="chart-empty">Loading history…</p>
-    <p class="count">Hover for values, click a legend entry to hide it.</p>
+    <div class="chart-foot">
+      <p class="count">Hover for values, drag across the chart to zoom in, click a legend entry to hide it.</p>
+      <button class="chip-btn" id="reset-zoom" hidden>Reset zoom</button>
+    </div>
   </section>
 
   <div class="filters" role="group" aria-label="Filter jobs">
@@ -161,6 +167,7 @@ const POLL_MS = 15000;
 let state = null;
 let lastOk = 0;
 let history = null;
+let zoom = null;  // { from, to } in ms while zoomed in
 const prefs = { family: 'all', mine: false, hideSup: false, hours: 24 };
 try { Object.assign(prefs, JSON.parse(localStorage.getItem('ciQueuePrefs') || '{}')); } catch {}
 
@@ -194,7 +201,8 @@ async function poll() {
 
 async function loadHistory() {
   try {
-    const response = await fetch(`/api/history?hours=${prefs.hours}`, { cache: 'no-store' });
+    const query = zoom ? `from=${Math.round(zoom.from)}&to=${Math.round(zoom.to)}` : `hours=${prefs.hours}`;
+    const response = await fetch(`/api/history?${query}`, { cache: 'no-store' });
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     history = { ...(await response.json()), fetched: Date.now() };
     renderChart();
@@ -425,14 +433,56 @@ document.querySelectorAll('[data-family]').forEach((button) => {
   button.addEventListener('click', () => { prefs.family = button.dataset.family; savePrefs(); syncControls(); render(); });
 });
 document.querySelectorAll('[data-hours]').forEach((button) => {
-  button.addEventListener('click', () => { prefs.hours = Number(button.dataset.hours); savePrefs(); syncControls(); loadHistory(); });
+  button.addEventListener('click', () => { prefs.hours = Number(button.dataset.hours); savePrefs(); setZoom(null); });
 });
+
+function setZoom(range) {
+  zoom = range;
+  $('reset-zoom').hidden = !zoom;
+  syncControls();
+  loadHistory();
+}
+$('reset-zoom').addEventListener('click', () => setZoom(null));
+
+// Drag across the chart to zoom into that time range.
+let dragFrom = null;
+const box = $('chart-box');
+const boxX = (event) => event.clientX - box.getBoundingClientRect().left;
+box.addEventListener('pointerdown', (event) => {
+  if (event.button !== 0 || !chart) return;
+  const area = chart.chartArea;
+  const x = boxX(event);
+  if (x < area.left || x > area.right) return;
+  dragFrom = x;
+  box.setPointerCapture(event.pointerId);
+});
+box.addEventListener('pointermove', (event) => {
+  if (dragFrom === null) return;
+  const area = chart.chartArea;
+  const x = Math.min(Math.max(boxX(event), area.left), area.right);
+  const sel = $('selection');
+  sel.hidden = false;
+  sel.style.left = `${Math.min(x, dragFrom)}px`;
+  sel.style.width = `${Math.abs(x - dragFrom)}px`;
+});
+box.addEventListener('pointerup', (event) => {
+  if (dragFrom === null) return;
+  const area = chart.chartArea;
+  const x = Math.min(Math.max(boxX(event), area.left), area.right);
+  const [a, b] = [Math.min(x, dragFrom), Math.max(x, dragFrom)];
+  dragFrom = null;
+  $('selection').hidden = true;
+  if (b - a < 8) return;
+  const scale = chart.scales.x;
+  setZoom({ from: scale.getValueForPixel(a), to: scale.getValueForPixel(b) });
+});
+box.addEventListener('dblclick', () => { if (zoom) setZoom(null); });
 $('only-mine').addEventListener('change', (e) => { prefs.mine = e.target.checked; savePrefs(); render(); });
 $('hide-sup').addEventListener('change', (e) => { prefs.hideSup = e.target.checked; savePrefs(); render(); });
 
 function syncControls() {
   document.querySelectorAll('[data-family]').forEach((b) => b.setAttribute('aria-pressed', String(b.dataset.family === prefs.family)));
-  document.querySelectorAll('[data-hours]').forEach((b) => b.setAttribute('aria-pressed', String(Number(b.dataset.hours) === prefs.hours)));
+  document.querySelectorAll('[data-hours]').forEach((b) => b.setAttribute('aria-pressed', String(!zoom && Number(b.dataset.hours) === prefs.hours)));
   $('only-mine').checked = prefs.mine;
   $('hide-sup').checked = prefs.hideSup;
 }

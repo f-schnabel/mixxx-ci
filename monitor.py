@@ -180,7 +180,13 @@ class Store:
             jobs = [dict(j) for j in self.db.execute(
                 'SELECT jobs.* FROM jobs JOIN runs ON runs.id = jobs.run_id '
                 "WHERE runs.created_at >= ? OR runs.status != 'completed'", (since,))]
-            covered = self.db.execute(
+            # The history is complete from the newest run whose jobs are still
+            # missing; runs of the last hour are fetched on the next round.
+            recent = dt.datetime.fromtimestamp(time.time() - 3600, UTC).isoformat()
+            gap = self.db.execute(
+                'SELECT MAX(created_at) FROM runs WHERE jobs_synced IS NULL AND created_at >= ? AND created_at < ?',
+                (since, recent)).fetchone()[0]
+            covered = gap or self.db.execute(
                 'SELECT MIN(created_at) FROM runs WHERE jobs_synced IS NOT NULL AND created_at >= ?',
                 (since,)).fetchone()[0]
         return runs, jobs, covered
@@ -285,7 +291,7 @@ class Monitor:
                 self.rebuild()
             except Exception as error:  # retry later
                 self.backfill_status = f'retrying after {type(error).__name__}: {error}'
-            time.sleep(300)
+            time.sleep(60)
 
     def list_runs_of_day(self, repo, day):
         # The runs API returns at most 1000 results per query, so list one day at a time.

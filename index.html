@@ -58,8 +58,9 @@ h1 span { color: var(--accent); }
 .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 14px 16px; }
 .panel-head { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 6px 16px; margin-bottom: 10px; }
 .panel h2 { margin: 0; font-size: 15px; font-weight: 600; }
-.chart-box { position: relative; height: 240px; cursor: crosshair; user-select: none; }
-.selection { position: absolute; top: 0; bottom: 0; background: color-mix(in srgb, var(--accent) 18%, transparent);
+.chart-box { position: relative; height: 240px; user-select: none; }
+#chart-box { cursor: crosshair; }
+.selection { position: absolute; background: color-mix(in srgb, var(--accent) 18%, transparent);
   border-inline: 1px solid var(--accent); pointer-events: none; }
 .chart-foot { display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: center; justify-content: space-between; }
 .empty { color: var(--muted); font-size: 13px; padding: 8px 0; }
@@ -522,9 +523,11 @@ const box = $('chart-box');
 const boxX = (event) => event.clientX - box.getBoundingClientRect().left;
 box.addEventListener('pointerdown', (event) => {
   if (event.button !== 0 || !chart) return;
+  // Only inside the plot area, so the legend below stays clickable.
   const area = chart.chartArea;
   const x = boxX(event);
-  if (x < area.left || x > area.right) return;
+  const y = event.clientY - box.getBoundingClientRect().top;
+  if (x < area.left || x > area.right || y < area.top || y > area.bottom) return;
   dragFrom = x;
   box.setPointerCapture(event.pointerId);
 });
@@ -534,6 +537,8 @@ box.addEventListener('pointermove', (event) => {
   const x = Math.min(Math.max(boxX(event), area.left), area.right);
   const sel = $('selection');
   sel.hidden = false;
+  sel.style.top = `${area.top}px`;
+  sel.style.height = `${area.bottom - area.top}px`;
   sel.style.left = `${Math.min(x, dragFrom)}px`;
   sel.style.width = `${Math.abs(x - dragFrom)}px`;
 });

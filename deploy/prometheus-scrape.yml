@@ -1,7 +1,0 @@
-# Add to scrape_configs in prometheus.yml
-  - job_name: "mixxx-ci-queue"
-    scrape_interval: 60s
-    static_configs:
-      - targets: ["localhost:8765"]
-        labels:
-          app: "mixxx-ci-queue"

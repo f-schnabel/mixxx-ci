@@ -1,9 +1,0 @@
-apiVersion: 1
-providers:
-  - name: mixxx-ci-queue
-    folder: Mixxx
-    type: file
-    allowUiUpdates: false
-    updateIntervalSeconds: 60
-    options:
-      path: __REPO_DIR__/deploy/grafana/dashboards

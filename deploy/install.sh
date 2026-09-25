@@ -1,5 +1,5 @@
 #!/bin/bash
-# Sets up the monitor as a user service, its Caddy site and the Grafana dashboard.
+# Sets up the monitor as a user service and its Caddy site.
 # Runs on every deploy; safe to run again.
 set -euo pipefail
 
@@ -16,14 +16,6 @@ if [[ ! -f "$REPO_DIR/.env" ]]; then
     echo "Created $REPO_DIR/.env, fill in GITHUB_TOKEN."
 fi
 chmod 600 "$REPO_DIR/.env"
-
-# Grafana reads the dashboard straight from this repo
-path="$REPO_DIR"
-while [[ "$path" != "/" ]]; do
-    sudo chmod o+x "$path"
-    path="$(dirname "$path")"
-done
-chmod -R o+rX "$DEPLOY/grafana"
 
 echo "Setting up the monitor service..."
 sed -e "s|__REPO_DIR__|$REPO_DIR|g" "$DEPLOY/mixxx-ci-queue.service.template" > "$DEPLOY/mixxx-ci-queue.service"
@@ -44,15 +36,5 @@ echo "Setting up the Caddy site..."
 sudo ln -sf "$DEPLOY/mixxx-ci.caddyfile" /etc/caddy/mixxx-ci.caddyfile
 sudo caddy validate --config /etc/caddy/Caddyfile
 sudo systemctl reload caddy
-
-echo "Setting up the Grafana dashboard..."
-sed -e "s|__REPO_DIR__|$REPO_DIR|g" "$DEPLOY/grafana/dashboard-provider.yaml.template" > "$DEPLOY/grafana/dashboard-provider.yaml"
-provider=/etc/grafana/provisioning/dashboards/mixxx-ci-queue.yaml
-if [[ "$(readlink "$provider" || true)" != "$DEPLOY/grafana/dashboard-provider.yaml" ]]; then
-    sudo mkdir -p "$(dirname "$provider")"
-    sudo ln -sf "$DEPLOY/grafana/dashboard-provider.yaml" "$provider"
-    # Grafana only reads new providers on start; dashboard changes are picked up within a minute.
-    sudo systemctl restart grafana-server
-fi
 
 echo "Done."

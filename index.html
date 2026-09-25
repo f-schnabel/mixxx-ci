@@ -111,10 +111,17 @@ footer { color: var(--muted); font-size: 12px; }
   <section class="panel">
     <div class="panel-head">
       <h2>Queue over time</h2>
-      <span class="count">hover for values · click a legend entry to hide it</span>
+      <div class="filters" role="group" aria-label="Chart range">
+        <button class="chip-btn" data-hours="6" aria-pressed="false">6 h</button>
+        <button class="chip-btn" data-hours="24" aria-pressed="true">24 h</button>
+        <button class="chip-btn" data-hours="72" aria-pressed="false">3 days</button>
+        <button class="chip-btn" data-hours="168" aria-pressed="false">7 days</button>
+        <button class="chip-btn" data-hours="336" aria-pressed="false">14 days</button>
+      </div>
     </div>
     <div class="chart-box"><canvas id="chart" role="img" aria-label="Queued and running jobs over time"></canvas></div>
-    <p class="empty" id="chart-empty">Collecting data, the chart fills in after a few polls.</p>
+    <p class="empty" id="chart-empty">Loading history…</p>
+    <p class="count">Hover for values, click a legend entry to hide it.</p>
   </section>
 
   <div class="filters" role="group" aria-label="Filter jobs">
@@ -153,7 +160,8 @@ footer { color: var(--muted); font-size: 12px; }
 const POLL_MS = 15000;
 let state = null;
 let lastOk = 0;
-const prefs = { family: 'all', mine: false, hideSup: false };
+let history = null;
+const prefs = { family: 'all', mine: false, hideSup: false, hours: 24 };
 try { Object.assign(prefs, JSON.parse(localStorage.getItem('ciQueuePrefs') || '{}')); } catch {}
 
 const $ = (id) => document.getElementById(id);
@@ -178,8 +186,21 @@ async function poll() {
     state = await response.json();
     lastOk = Date.now();
     render();
+    if (!history || Date.now() - history.fetched > 60000) loadHistory();
   } catch (error) {
     renderStatus(`Monitor not reachable (${error.message}). Is monitor.py still running?`);
+  }
+}
+
+async function loadHistory() {
+  try {
+    const response = await fetch(`/api/history?hours=${prefs.hours}`, { cache: 'no-store' });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    history = { ...(await response.json()), fetched: Date.now() };
+    renderChart();
+  } catch (error) {
+    $('chart-empty').hidden = false;
+    $('chart-empty').textContent = `History could not be loaded (${error.message}).`;
   }
 }
 
@@ -233,21 +254,42 @@ function render() {
     const wait = since(oldest.created_at);
     $('t-wait').innerHTML = `<span class="${wait > 2 * 3600e3 ? 'bad' : wait > 3600e3 ? 'warn' : ''}">${fmtDur(wait)}</span>`;
     $('t-wait-note').innerHTML = `<a href="${esc(oldest.url)}" target="_blank" rel="noopener">${esc(oldest.name.replace('build / ', ''))}</a> · ${esc(oldest.branch)}`;
-    const drain = (macQueued.length * snap.macos_minutes) / macSlots;
-    $('t-drain').textContent = `~${fmtDur(drain * 60000)}`;
-    $('t-drain-note').textContent = `${macQueued.length} jobs × ~${snap.macos_minutes} min on ${macSlots} slots, without new pushes`;
   } else {
     $('t-wait').textContent = '0m';
     $('t-wait-note').textContent = 'no macOS job waiting';
-    $('t-drain').textContent = '0m';
-    $('t-drain-note').textContent = 'queue is empty';
   }
+  renderBacklog(snap, macQueued.length, macSlots);
 
-  $('footer').innerHTML = `Watching ${snap.repos.map(esc).join(', ')} · ${sup.length} unfinished jobs belong to pull request runs that already have a newer run · limits: ${total} jobs, ${macSlots} macOS (org-wide)`;
+  const historyFrom = snap.history_from ? new Date(snap.history_from).toLocaleString() : 'not yet';
+  const backfill = snap.backfill === 'complete' ? '' : ` (backfill: ${esc(snap.backfill)})`;
+  $('footer').innerHTML = `Watching ${snap.repos.map(esc).join(', ')} · history since ${esc(historyFrom)}${backfill} · ${sup.length} unfinished jobs belong to pull request runs that already have a newer run · limits: ${total} jobs, ${macSlots} macOS (org-wide)`;
 
   renderChart();
   renderLists(snap);
   renderLabels(running, queued);
+}
+
+function renderBacklog(snap, queued, slots) {
+  const { median_minutes: minutes, added_per_hour: added, finished_per_hour: finished } = snap.macos || {};
+  if (!queued) {
+    $('t-drain').textContent = '0m';
+    $('t-drain-note').textContent = 'queue is empty';
+    return;
+  }
+  if (!minutes) {
+    $('t-drain').textContent = '–';
+    $('t-drain-note').textContent = 'no finished macOS jobs in the last 24 h yet';
+    return;
+  }
+  const rate = `${added} new vs ${finished} finished per hour (last 6 h)`;
+  if (added >= finished) {
+    $('t-drain').innerHTML = '<span class="bad">not shrinking</span>';
+    $('t-drain-note').textContent = `${rate}; ~${fmtDur((queued * minutes / slots) * 60000)} if nothing new arrives`;
+  } else {
+    const hours = queued / (finished - added);
+    $('t-drain').textContent = `~${fmtDur(hours * 3600e3)}`;
+    $('t-drain-note').textContent = `${rate}, jobs take ~${minutes} min`;
+  }
 }
 
 function visible(job, me) {
@@ -300,26 +342,20 @@ const SERIES = [
   { key: 'mac_queued', label: 'macOS queued', color: '--queue', fill: '--queue-soft' },
   { key: 'mac_running', label: 'macOS running', color: '--sup' },
   { key: 'running', label: 'All running', color: '--run' },
-  { key: 'queued', label: 'All queued', color: '--crit', hidden: true },
+  { key: 'superseded_queued', label: 'Superseded queued', color: '--crit' },
+  { key: 'queued', label: 'All queued', color: '--muted', hidden: true },
+  { key: 'mac_wait_minutes', label: 'Oldest macOS wait (h)', color: '--accent', hidden: true, axis: 'wait', scale: 1 / 60 },
 ];
 
-function chartPoints(key) {
-  // Break the line where the monitor was not running.
-  const maxGap = 3 * (state.interval ?? 60) * 1000;
-  const out = [];
-  let prev = null;
-  for (const p of state.history) {
-    const x = new Date(p.t).getTime();
-    if (prev !== null && x - prev > maxGap) out.push({ x: prev + 1, y: null });
-    out.push({ x, y: p[key] });
-    prev = x;
-  }
-  return out;
+function chartPoints(series) {
+  return history.points.map((p) => ({ x: p.t, y: series.scale ? p[series.key] * series.scale : p[series.key] }));
 }
 
 function renderChart() {
-  const points = state.history;
+  if (!history) return;
+  const points = history.points;
   $('chart-empty').hidden = points.length >= 2;
+  if (points.length < 2) $('chart-empty').textContent = 'No history yet, the backfill is still running.';
   if (typeof Chart === 'undefined') {
     $('chart-empty').hidden = false;
     $('chart-empty').textContent = 'Chart.js could not be loaded (offline?).';
@@ -333,7 +369,8 @@ function renderChart() {
     : { hour: '2-digit', minute: '2-digit' });
   const datasets = SERIES.map((s) => ({
     label: s.label,
-    data: chartPoints(s.key),
+    yAxisID: s.axis || 'y',
+    data: chartPoints(s),
     borderColor: token(s.color),
     backgroundColor: s.fill ? token(s.fill) : token(s.color),
     fill: Boolean(s.fill),
@@ -342,8 +379,7 @@ function renderChart() {
     borderWidth: 2,
     pointRadius: 0,
     pointHoverRadius: 4,
-    tension: 0.2,
-    spanGaps: false,
+    stepped: 'after',
   }));
   Chart.defaults.font.family = token('--mono');
   if (!chart) {
@@ -358,6 +394,8 @@ function renderChart() {
         scales: {
           x: { type: 'linear', ticks: { maxTicksLimit: 8 }, grid: { display: false } },
           y: { beginAtZero: true, ticks: { precision: 0 } },
+          wait: { position: 'right', beginAtZero: true, display: 'auto', grid: { display: false },
+                  title: { display: true, text: 'wait (h)' } },
         },
         plugins: {
           legend: { position: 'bottom', labels: { boxWidth: 14, boxHeight: 3 } },
@@ -372,11 +410,12 @@ function renderChart() {
   const { x, y } = chart.options.scales;
   // Start and end the axis at the data instead of at rounded tick values.
   if (points.length) {
-    x.min = new Date(points[0].t).getTime();
-    x.max = new Date(points[points.length - 1].t).getTime();
+    x.min = points[0].t;
+    x.max = points[points.length - 1].t;
   }
   x.ticks.callback = tick;
-  x.ticks.color = y.ticks.color = token('--muted');
+  const { wait } = chart.options.scales;
+  x.ticks.color = y.ticks.color = wait.ticks.color = wait.title.color = token('--muted');
   y.grid.color = token('--line');
   chart.options.plugins.legend.labels.color = token('--ink');
   chart.update('none');
@@ -385,11 +424,15 @@ function renderChart() {
 document.querySelectorAll('[data-family]').forEach((button) => {
   button.addEventListener('click', () => { prefs.family = button.dataset.family; savePrefs(); syncControls(); render(); });
 });
+document.querySelectorAll('[data-hours]').forEach((button) => {
+  button.addEventListener('click', () => { prefs.hours = Number(button.dataset.hours); savePrefs(); syncControls(); loadHistory(); });
+});
 $('only-mine').addEventListener('change', (e) => { prefs.mine = e.target.checked; savePrefs(); render(); });
 $('hide-sup').addEventListener('change', (e) => { prefs.hideSup = e.target.checked; savePrefs(); render(); });
 
 function syncControls() {
   document.querySelectorAll('[data-family]').forEach((b) => b.setAttribute('aria-pressed', String(b.dataset.family === prefs.family)));
+  document.querySelectorAll('[data-hours]').forEach((b) => b.setAttribute('aria-pressed', String(Number(b.dataset.hours) === prefs.hours)));
   $('only-mine').checked = prefs.mine;
   $('hide-sup').checked = prefs.hideSup;
 }

@@ -19,13 +19,9 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: Check Python
-        run: python3 -m py_compile monitor.py deploy/grafana/build_dashboard.py
+        run: python3 -m py_compile monitor.py
       - name: Check install script
         run: bash -n deploy/install.sh
-      - name: Check that the dashboard JSON is up to date
-        run: |
-          python3 deploy/grafana/build_dashboard.py
-          git diff --exit-code deploy/grafana/dashboards
 
   deploy:
     needs: check

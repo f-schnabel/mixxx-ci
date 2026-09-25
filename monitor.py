@@ -2,23 +2,31 @@
 """Live monitor for the mixxxdj GitHub Actions runner queue.
 
     python monitor.py            # serve the dashboard on http://127.0.0.1:8765
-    python monitor.py --once     # print one snapshot and exit
+    python monitor.py --once     # poll once, print a summary and exit
 
-Endpoints: / (dashboard), /api/state (JSON), /metrics (Prometheus).
+Endpoints: / (dashboard), /api/state (current jobs), /api/history?hours=24 (chart data).
+
+Runs and jobs are cached in SQLite. A run's jobs are only fetched again when the
+run's updated_at changes, and the chart is computed from the jobs' created,
+started and completed times, so it also covers the days before the monitor ran.
 Uses $GITHUB_TOKEN, or the token of the logged-in GitHub CLI (`gh auth token`).
 """
 
 import argparse
 import datetime as dt
 import json
+import math
 import os
+import sqlite3
+import statistics
 import subprocess
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.error import HTTPError
+from urllib.parse import parse_qs, urlsplit
 from urllib.request import Request, urlopen
 
 ORG = 'mixxxdj'
@@ -26,14 +34,22 @@ API = 'https://api.github.com'
 HERE = Path(__file__).resolve().parent
 ALWAYS_WATCHED = ['mixxx', 'vcpkg']
 ACTIVE_REPO_DAYS = 7
-HISTORY_LEN = 14 * 24 * 60  # two weeks at one poll per minute
-RUN_STATUSES = ['queued', 'in_progress', 'pending', 'waiting', 'requested']
 FAMILIES = ['macOS', 'Linux', 'Windows', 'Other']
+HISTORY_POINTS = 720
+BACKFILL_RESERVE = 1000  # API calls left for live polling while backfilling
 UTC = dt.timezone.utc
 
 
 def parse_time(value):
     return dt.datetime.fromisoformat(value.replace('Z', '+00:00')) if value else None
+
+
+def timestamp(value):
+    return parse_time(value).timestamp() if value else None
+
+
+def iso_date(ts):
+    return dt.datetime.fromtimestamp(ts, UTC).strftime('%Y-%m-%d')
 
 
 def runner_family(labels):
@@ -59,6 +75,7 @@ class GitHub:
     def __init__(self):
         self.token = github_token()
         self.rate_remaining = None
+        self.rate_reset = 0
 
     def get(self, path):
         request = Request(
@@ -71,8 +88,102 @@ class GitHub:
             },
         )
         with urlopen(request, timeout=30) as response:
-            self.rate_remaining = response.headers.get('X-RateLimit-Remaining')
+            self.rate_remaining = int(response.headers.get('X-RateLimit-Remaining', 0))
+            self.rate_reset = int(response.headers.get('X-RateLimit-Reset', 0))
             return json.load(response)
+
+    def wait_for_budget(self, reserve):
+        """Sleeps until the rate limit resets when fewer than `reserve` calls are left."""
+        if self.rate_remaining is not None and self.rate_remaining < reserve:
+            time.sleep(max(0, self.rate_reset - time.time()) + 5)
+
+
+class Store:
+    RUN_FIELDS = ['id', 'repo', 'workflow_id', 'workflow', 'event', 'head_repo', 'head_branch', 'title', 'url',
+                  'actor', 'created_at', 'updated_at', 'status']
+    JOB_FIELDS = ['id', 'run_id', 'name', 'url', 'labels', 'runner_name', 'status', 'conclusion', 'created_at',
+                  'started_at', 'completed_at']
+
+    def __init__(self, path):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self.db = sqlite3.connect(path, check_same_thread=False)
+        self.db.row_factory = sqlite3.Row
+        self.lock = threading.Lock()
+        with self.lock, self.db:
+            self.db.executescript('''
+                CREATE TABLE IF NOT EXISTS runs (
+                    id INTEGER PRIMARY KEY, repo TEXT, workflow_id INTEGER, workflow TEXT, event TEXT,
+                    head_repo TEXT, head_branch TEXT, title TEXT, url TEXT, actor TEXT,
+                    created_at TEXT, updated_at TEXT, status TEXT,
+                    jobs_synced TEXT  -- the run's updated_at when its jobs were last fetched
+                );
+                CREATE INDEX IF NOT EXISTS runs_created ON runs (created_at);
+                CREATE TABLE IF NOT EXISTS jobs (
+                    id INTEGER PRIMARY KEY, run_id INTEGER, name TEXT, url TEXT, labels TEXT, runner_name TEXT,
+                    status TEXT, conclusion TEXT, created_at TEXT, started_at TEXT, completed_at TEXT
+                );
+                CREATE INDEX IF NOT EXISTS jobs_run ON jobs (run_id);
+            ''')
+
+    def save_runs(self, repo, runs):
+        rows = [(
+            run['id'], repo, run['workflow_id'], run['name'], run['event'],
+            (run.get('head_repository') or {}).get('full_name'), run['head_branch'], run['display_title'],
+            run['html_url'], (run.get('triggering_actor') or run.get('actor') or {}).get('login'),
+            run['created_at'], run['updated_at'], run['status'],
+        ) for run in runs]
+        updates = ', '.join(f'{f} = excluded.{f}' for f in self.RUN_FIELDS[1:])
+        with self.lock, self.db:
+            self.db.executemany(
+                f'INSERT INTO runs ({", ".join(self.RUN_FIELDS)}) VALUES ({", ".join("?" * len(self.RUN_FIELDS))}) '
+                f'ON CONFLICT (id) DO UPDATE SET {updates}', rows)
+
+    def save_jobs(self, run_id, synced_at, jobs):
+        rows = [(
+            job['id'], run_id, job['name'], job['html_url'], json.dumps(job['labels']), job['runner_name'],
+            job['status'],
+            job['conclusion'], job['created_at'], job['started_at'], job['completed_at'],
+        ) for job in jobs]
+        with self.lock, self.db:
+            self.db.executemany(f'INSERT OR REPLACE INTO jobs VALUES ({", ".join("?" * len(self.JOB_FIELDS))})', rows)
+            self.db.execute('UPDATE runs SET jobs_synced = ? WHERE id = ?', (synced_at, run_id))
+
+    def active_runs(self):
+        with self.lock:
+            return [(r['id'], r['repo']) for r in self.db.execute("SELECT id, repo FROM runs WHERE status != 'completed'")]
+
+    def runs_needing_jobs(self, since, only_active=False):
+        """Runs whose jobs changed since they were last fetched, newest first."""
+        query = ('SELECT id, repo, updated_at FROM runs WHERE created_at >= ? '
+                 'AND (jobs_synced IS NULL OR jobs_synced != updated_at)')
+        if only_active:
+            # Finished runs seen for the first time are left to the backfill thread.
+            query += " AND (status != 'completed' OR jobs_synced IS NOT NULL)"
+        with self.lock:
+            return [tuple(r) for r in self.db.execute(query + ' ORDER BY created_at DESC', (since,))]
+
+    def delete_run(self, run_id):
+        with self.lock, self.db:
+            self.db.execute('DELETE FROM jobs WHERE run_id = ?', (run_id,))
+            self.db.execute('DELETE FROM runs WHERE id = ?', (run_id,))
+
+    def prune(self, before):
+        with self.lock, self.db:
+            self.db.execute("DELETE FROM jobs WHERE run_id IN "
+                            "(SELECT id FROM runs WHERE created_at < ? AND status = 'completed')", (before,))
+            self.db.execute("DELETE FROM runs WHERE created_at < ? AND status = 'completed'", (before,))
+
+    def load(self, since):
+        with self.lock:
+            runs = {r['id']: dict(r) for r in self.db.execute(
+                "SELECT * FROM runs WHERE created_at >= ? OR status != 'completed'", (since,))}
+            jobs = [dict(j) for j in self.db.execute(
+                'SELECT jobs.* FROM jobs JOIN runs ON runs.id = jobs.run_id '
+                "WHERE runs.created_at >= ? OR runs.status != 'completed'", (since,))]
+            covered = self.db.execute(
+                'SELECT MIN(created_at) FROM runs WHERE jobs_synced IS NOT NULL AND created_at >= ?',
+                (since,)).fetchone()[0]
+        return runs, jobs, covered
 
 
 class Monitor:
@@ -80,220 +191,261 @@ class Monitor:
         self.args = args
         self.gh = GitHub()
         self.me = self.gh.get('/user')['login']
-        self.repos = []
-        self.repos_checked = 0.0
+        self.store = Store(Path(args.data_dir) / 'cache.sqlite')
+        self.org_repos = []
+        self.org_repos_checked = 0.0
         self.snapshot = None
+        self.model = None
+        self.history_cache = {}
         self.error = None
-        self.last_success = None
-        self.poll_duration = None
-        self.poll_errors = 0
-        self.history_file = Path(args.history_file)
-        self.history = self.load_history()
+        self.backfill_status = 'waiting'
         self.lock = threading.Lock()
 
-    def load_history(self):
-        if not self.history_file.exists():
-            return []
-        lines = self.history_file.read_text(encoding='utf-8').splitlines()[-HISTORY_LEN:]
-        history = [json.loads(line) for line in lines if line.strip()]
-        self.history_file.write_text(''.join(json.dumps(p) + '\n' for p in history), encoding='utf-8')
-        return history
+    def window_start(self):
+        return time.time() - self.args.days * 86400
 
-    def watched_repos(self):
-        if time.time() - self.repos_checked > 600:
-            cutoff = dt.datetime.now(UTC) - dt.timedelta(days=ACTIVE_REPO_DAYS)
-            repos = self.gh.get(f'/orgs/{ORG}/repos?sort=pushed&per_page=100')
-            active = [r['name'] for r in repos if not r['archived'] and parse_time(r['pushed_at']) > cutoff]
-            self.repos = sorted(set(active) | set(ALWAYS_WATCHED))
-            self.repos_checked = time.time()
-        return self.repos
+    def watched_repos(self, days):
+        if time.time() - self.org_repos_checked > 600:
+            self.org_repos = [r for r in self.gh.get(f'/orgs/{ORG}/repos?sort=pushed&per_page=100')
+                              if not r['archived']]
+            self.org_repos_checked = time.time()
+        cutoff = time.time() - days * 86400
+        active = [r['name'] for r in self.org_repos if timestamp(r['pushed_at']) > cutoff]
+        return sorted(set(active) | set(ALWAYS_WATCHED))
 
-    def take_snapshot(self):
-        repos = self.watched_repos()
+    def sync_jobs(self, run):
+        run_id, repo, updated_at = run
+        jobs, page = [], 1
+        try:
+            while True:
+                listing = self.gh.get(
+                    f'/repos/{ORG}/{repo}/actions/runs/{run_id}/jobs?filter=all&per_page=100&page={page}')
+                jobs += listing['jobs']
+                if len(jobs) >= listing['total_count'] or not listing['jobs']:
+                    break
+                page += 1
+        except HTTPError as error:
+            if error.code == 404:
+                self.store.delete_run(run_id)
+                return
+            raise
+        self.store.save_jobs(run_id, updated_at, jobs)
+
+    def poll(self):
+        repos = self.watched_repos(ACTIVE_REPO_DAYS)
+        since = dt.datetime.fromtimestamp(self.window_start(), UTC).isoformat()
         with ThreadPoolExecutor(8) as pool:
-            listings = pool.map(
-                lambda rs: (rs[0], self.gh.get(f'/repos/{ORG}/{rs[0]}/actions/runs?status={rs[1]}&per_page=100')),
-                [(repo, status) for repo in repos for status in RUN_STATUSES],
-            )
-            runs = {}
-            for repo, listing in listings:
-                for run in listing['workflow_runs']:
-                    runs[run['id']] = (repo, run)
-            # The newest run per pull request, including finished ones, so an old
-            # run still waiting in the queue is marked even when its successor
-            # already failed or was cancelled.
-            recent_pr_runs = pool.map(
-                lambda repo: (repo, self.gh.get(f'/repos/{ORG}/{repo}/actions/runs?event=pull_request&per_page=100')),
-                repos,
-            )
-            recent_pr_runs = [(repo, run) for repo, listing in recent_pr_runs for run in listing['workflow_runs']]
-            job_lists = pool.map(
-                lambda item: (item, self.gh.get(f'/repos/{ORG}/{item[0]}/actions/runs/{item[1]["id"]}/jobs?per_page=100')),
-                list(runs.values()),
-            )
-            job_lists = list(job_lists)
+            seen = set()
+            for repo, runs in pool.map(
+                    lambda r: (r, self.gh.get(f'/repos/{ORG}/{r}/actions/runs?per_page=100')['workflow_runs']), repos):
+                self.store.save_runs(repo, runs)
+                seen |= {run['id'] for run in runs}
+            # Active runs that dropped off the first page, e.g. long vcpkg builds
+            stale = [(run_id, repo) for run_id, repo in self.store.active_runs() if run_id not in seen]
+            for repo, run in pool.map(self.fetch_run, stale):
+                if run is not None:
+                    self.store.save_runs(repo, [run])
+            list(pool.map(self.sync_jobs, self.store.runs_needing_jobs(since, only_active=True)))
+        self.rebuild()
 
-        # A pull request run is superseded when a newer run of the same workflow
-        # exists for the same head branch.
-        newest = {}
-        for repo, run in [*runs.values(), *recent_pr_runs]:
-            key = self.run_key(repo, run)
-            if key and (key not in newest or run['created_at'] > newest[key]):
-                newest[key] = run['created_at']
+    def fetch_run(self, item):
+        run_id, repo = item
+        try:
+            return repo, self.gh.get(f'/repos/{ORG}/{repo}/actions/runs/{run_id}')
+        except HTTPError as error:
+            if error.code == 404:
+                self.store.delete_run(run_id)
+                return repo, None
+            raise
 
-        jobs = []
-        for (repo, run), listing in job_lists:
-            key = self.run_key(repo, run)
-            superseded = bool(key) and run['created_at'] < newest[key]
-            for job in listing['jobs']:
-                if job['status'] == 'completed':
+    def backfill_forever(self):
+        """Fills the cache with the runs of the last days, then keeps catching up
+        on runs that finished between two polls."""
+        listed = False
+        while True:
+            try:
+                start = self.window_start()
+                if not listed:
+                    for repo in self.watched_repos(self.args.days):
+                        day = start
+                        while day < time.time() + 86400:
+                            self.list_runs_of_day(repo, iso_date(day))
+                            day += 86400
+                    listed = True
+                since = dt.datetime.fromtimestamp(start, UTC).isoformat()
+                todo = self.store.runs_needing_jobs(since)
+                for i, run in enumerate(todo):
+                    self.backfill_status = f'fetching jobs of {len(todo) - i} runs'
+                    self.gh.wait_for_budget(BACKFILL_RESERVE)
+                    self.sync_jobs(run)
+                    if i % 50 == 49:
+                        self.rebuild()
+                self.store.prune(since)
+                self.backfill_status = 'complete'
+                self.rebuild()
+            except Exception as error:  # retry later
+                self.backfill_status = f'retrying after {type(error).__name__}: {error}'
+            time.sleep(300)
+
+    def list_runs_of_day(self, repo, day):
+        # The runs API returns at most 1000 results per query, so list one day at a time.
+        page = 1
+        while True:
+            self.backfill_status = f'listing {repo} runs of {day}'
+            self.gh.wait_for_budget(BACKFILL_RESERVE)
+            runs = self.gh.get(
+                f'/repos/{ORG}/{repo}/actions/runs?created={day}&per_page=100&page={page}')['workflow_runs']
+            self.store.save_runs(repo, runs)
+            if len(runs) < 100:
+                return
+            page += 1
+
+    def rebuild(self):
+        """Recomputes the current state from the cache."""
+        since = dt.datetime.fromtimestamp(self.window_start(), UTC).isoformat()
+        runs, jobs, covered = self.store.load(since)
+        now = time.time()
+
+        # A pull request run is superseded from the moment a newer run of the same
+        # workflow for the same head branch was created.
+        by_key = {}
+        for run in runs.values():
+            if run['event'] == 'pull_request':
+                key = (run['repo'], run['workflow_id'], run['head_repo'], run['head_branch'])
+                by_key.setdefault(key, []).append(run)
+        superseded_since = {}
+        for group in by_key.values():
+            group.sort(key=lambda r: r['created_at'])
+            for older, newer in zip(group, group[1:]):
+                superseded_since[older['id']] = timestamp(newer['created_at'])
+
+        model = []
+        seen = set()
+        for job in jobs:
+            run = runs.get(job['run_id'])
+            labels = json.loads(job['labels'])
+            if run is None or not labels or job['conclusion'] == 'skipped':
+                continue
+            # A re-run copies the jobs it does not repeat into the new attempt,
+            # with the same runner and times.
+            if job['runner_name']:
+                key = (job['run_id'], job['name'], job['runner_name'], job['started_at'])
+                if key in seen:
                     continue
-                jobs.append({
-                    'repo': repo,
-                    'run_id': run['id'],
-                    'run_url': run['html_url'],
-                    'run_title': run['display_title'],
-                    'workflow': run['name'],
-                    'branch': run['head_branch'],
-                    'event': run['event'],
-                    'actor': (run.get('triggering_actor') or run.get('actor') or {}).get('login'),
-                    'name': job['name'],
-                    'url': job['html_url'],
-                    'status': job['status'],
-                    'labels': job['labels'],
-                    'family': runner_family(job['labels']),
-                    'created_at': job['created_at'],
-                    'started_at': job['started_at'] if job['status'] == 'in_progress' else None,
-                    'superseded': superseded,
-                })
-        return {
+                seen.add(key)
+            # GitHub fills started_at already while a job is queued; a job only
+            # ran when a runner picked it up.
+            ran = job['status'] == 'in_progress' or (job['status'] == 'completed' and bool(job['runner_name']))
+            model.append({
+                'job': job, 'run': run, 'labels': labels, 'family': runner_family(labels),
+                'created': timestamp(job['created_at']), 'started': timestamp(job['started_at']) if ran else None,
+                'completed': timestamp(job['completed_at']) if job['status'] == 'completed' else None,
+                'superseded_since': superseded_since.get(run['id']),
+            })
+
+        current = []
+        for m in model:
+            job, run = m['job'], m['run']
+            if job['status'] == 'completed':
+                continue
+            current.append({
+                'repo': run['repo'], 'run_id': run['id'], 'run_url': run['url'], 'run_title': run['title'],
+                'workflow': run['workflow'], 'branch': run['head_branch'], 'event': run['event'],
+                'actor': run['actor'], 'name': job['name'], 'url': job['url'], 'status': job['status'],
+                'labels': m['labels'], 'family': m['family'], 'created_at': job['created_at'],
+                'started_at': job['started_at'] if job['status'] == 'in_progress' else None,
+                'superseded': m['superseded_since'] is not None,
+            })
+
+        snapshot = {
             'taken_at': dt.datetime.now(UTC).isoformat(),
-            'repos': repos,
+            'repos': self.watched_repos(ACTIVE_REPO_DAYS),
             'me': self.me,
             'rate_remaining': self.gh.rate_remaining,
             'limits': {'total': self.args.total_slots, 'macOS': self.args.macos_slots},
-            'macos_minutes': self.args.macos_minutes,
-            'jobs': jobs,
-        }
-
-    @staticmethod
-    def run_key(repo, run):
-        if run['event'] != 'pull_request':
-            return None
-        head = (run.get('head_repository') or {}).get('full_name')
-        return (repo, run['workflow_id'], head, run['head_branch'])
-
-    def refresh(self):
-        started = time.monotonic()
-        snapshot = self.take_snapshot()
-        jobs = snapshot['jobs']
-        point = {
-            't': snapshot['taken_at'],
-            'running': sum(j['status'] == 'in_progress' for j in jobs),
-            'queued': sum(j['status'] == 'queued' for j in jobs),
-            'mac_running': sum(j['status'] == 'in_progress' and j['family'] == 'macOS' for j in jobs),
-            'mac_queued': sum(j['status'] == 'queued' and j['family'] == 'macOS' for j in jobs),
+            'history_from': covered,
+            'backfill': self.backfill_status,
+            'macos': self.macos_stats(model, now),
+            'jobs': current,
         }
         with self.lock:
+            self.model = (model, now, timestamp(covered) or now)
             self.snapshot = snapshot
+            self.history_cache = {}
             self.error = None
-            self.last_success = time.time()
-            self.poll_duration = time.monotonic() - started
-            self.history = [*self.history, point][-HISTORY_LEN:]
-        with self.history_file.open('a', encoding='utf-8') as file:
-            file.write(json.dumps(point) + '\n')
+
+    @staticmethod
+    def macos_stats(model, now):
+        mac = [m for m in model if m['family'] == 'macOS']
+        ran = [m for m in mac if m['started'] and m['completed']]
+        durations = [(m['completed'] - m['started']) / 60 for m in ran
+                     if m['completed'] > now - 86400 and m['completed'] - m['started'] > 120]
+        hours = 6
+        return {
+            'median_minutes': round(statistics.median(durations)) if durations else None,
+            'added_per_hour': round(sum(1 for m in mac if m['created'] > now - hours * 3600) / hours, 1),
+            'finished_per_hour': round(sum(1 for m in ran if m['completed'] > now - hours * 3600) / hours, 1),
+        }
+
+    def history(self, hours):
+        with self.lock:
+            if hours in self.history_cache:
+                return self.history_cache[hours]
+            model, now, covered = self.model or ([], time.time(), time.time())
+        start = max(now - hours * 3600, covered)
+        step = max(60, math.ceil((now - start) / HISTORY_POINTS / 60) * 60)
+        count = int((now - start) // step) + 1
+        open_end = now + step  # jobs that are still queued or running count at the last sample
+        keys = ['running', 'queued', 'mac_running', 'mac_queued', 'superseded_queued']
+        series = {k: [0] * count for k in keys}
+        oldest_mac = [None] * count
+
+        def span(a, b):
+            """Indices of the sample times within [a, b)."""
+            return range(max(0, math.ceil((a - start) / step)), min(count, math.ceil((b - start) / step)))
+
+        for m in model:
+            queued_until = m['started'] or m['completed'] or open_end
+            mac = m['family'] == 'macOS'
+            for i in span(m['created'], queued_until):
+                series['queued'][i] += 1
+                if mac:
+                    series['mac_queued'][i] += 1
+                    if oldest_mac[i] is None or m['created'] < oldest_mac[i]:
+                        oldest_mac[i] = m['created']
+            if m['superseded_since'] is not None:
+                for i in span(max(m['created'], m['superseded_since']), queued_until):
+                    series['superseded_queued'][i] += 1
+            if m['started']:
+                for i in span(m['started'], m['completed'] or open_end):
+                    series['running'][i] += 1
+                    if mac:
+                        series['mac_running'][i] += 1
+
+        points = []
+        for i in range(count):
+            t = start + i * step
+            point = {'t': round(t * 1000), **{k: series[k][i] for k in keys}}
+            point['mac_wait_minutes'] = round((t - oldest_mac[i]) / 60) if oldest_mac[i] else 0
+            points.append(point)
+        result = {'step': step, 'from': round(start * 1000), 'points': points}
+        with self.lock:
+            self.history_cache[hours] = result
+        return result
 
     def poll_forever(self):
         while True:
             try:
-                self.refresh()
+                self.poll()
             except Exception as error:  # keep polling through network or API hiccups
                 with self.lock:
                     self.error = f'{type(error).__name__}: {error}'
-                    self.poll_errors += 1
             time.sleep(self.args.interval)
 
     def state(self):
         with self.lock:
-            return {
-                'snapshot': self.snapshot,
-                'history': self.history,
-                'error': self.error,
-                'interval': self.args.interval,
-            }
-
-    def metrics(self):
-        with self.lock:
-            snapshot, last_success = self.snapshot, self.last_success
-            poll_duration, poll_errors = self.poll_duration, self.poll_errors
-        lines = []
-
-        def metric(name, kind, help_text, samples):
-            lines.append(f'# HELP {name} {help_text}')
-            lines.append(f'# TYPE {name} {kind}')
-            for labels, value in samples:
-                label_text = ','.join(f'{k}="{escape_label(v)}"' for k, v in labels.items())
-                lines.append(f'{name}{{{label_text}}} {value}' if label_text else f'{name} {value}')
-
-        metric('mixxx_ci_poll_errors_total', 'counter', 'Failed GitHub polls since start.', [({}, poll_errors)])
-        metric('mixxx_ci_runner_limit', 'gauge', 'Concurrent job limit of the org.', [
-            ({'runner': 'all'}, self.args.total_slots),
-            ({'runner': 'macOS'}, self.args.macos_slots),
-        ])
-        if snapshot is None:
-            return '\n'.join(lines) + '\n'
-
-        jobs = snapshot['jobs']
-        now = dt.datetime.now(UTC)
-        status_of = {'in_progress': 'running', 'queued': 'queued'}
-
-        def count(pred):
-            return sum(1 for j in jobs if pred(j))
-
-        per_family = []
-        superseded = []
-        oldest = []
-        for family in FAMILIES:
-            for status, gh_status in (('running', 'in_progress'), ('queued', 'queued')):
-                per_family.append(({'runner': family, 'status': status},
-                                   count(lambda j: j['family'] == family and j['status'] == gh_status)))
-                superseded.append(({'runner': family, 'status': status},
-                                   count(lambda j: j['family'] == family and j['status'] == gh_status
-                                         and j['superseded'])))
-            waits = [(now - parse_time(j['created_at'])).total_seconds()
-                     for j in jobs if j['family'] == family and j['status'] == 'queued']
-            oldest.append(({'runner': family}, round(max(waits, default=0))))
-
-        by_label = {}
-        for job in jobs:
-            status = status_of.get(job['status'])
-            if status is None:
-                continue
-            key = (job['repo'], ','.join(job['labels']), status)
-            by_label[key] = by_label.get(key, 0) + 1
-
-        mine = [({'status': s}, count(lambda j: j['actor'] == self.me and j['status'] == g))
-                for s, g in (('running', 'in_progress'), ('queued', 'queued'))]
-
-        metric('mixxx_ci_jobs', 'gauge', 'Unfinished jobs by runner type and status.', per_family)
-        metric('mixxx_ci_jobs_by_label', 'gauge', 'Unfinished jobs by repository and runner label.',
-               [({'repo': r, 'label': lbl, 'status': s}, n) for (r, lbl, s), n in sorted(by_label.items())])
-        metric('mixxx_ci_superseded_jobs', 'gauge',
-               'Unfinished jobs of pull request runs that already have a newer run.', superseded)
-        metric('mixxx_ci_oldest_queued_seconds', 'gauge', 'Wait time of the oldest queued job.', oldest)
-        metric('mixxx_ci_my_jobs', 'gauge', 'Unfinished jobs triggered by the token owner.', mine)
-        if snapshot['rate_remaining'] is not None:
-            metric('mixxx_ci_github_rate_remaining', 'gauge', 'GitHub API requests left this hour.',
-                   [({}, snapshot['rate_remaining'])])
-        metric('mixxx_ci_last_poll_timestamp_seconds', 'gauge', 'Time of the last successful poll.',
-               [({}, round(last_success, 3))])
-        metric('mixxx_ci_poll_duration_seconds', 'gauge', 'Duration of the last successful poll.',
-               [({}, round(poll_duration, 3))])
-        return '\n'.join(lines) + '\n'
-
-
-def escape_label(value):
-    return str(value).replace('\\', '\\\\').replace('"', '\\"').replace('\n', '\\n')
+            return {'snapshot': self.snapshot, 'error': self.error, 'interval': self.args.interval,
+                    'days': self.args.days}
 
 
 def print_summary(snapshot):
@@ -310,23 +462,31 @@ def print_summary(snapshot):
         wait = int((now - parse_time(q[0]['created_at'])).total_seconds() // 60) if q else 0
         oldest = f'  oldest wait {wait} min' if q else ''
         print(f'  {family:8} running {len(r):3}  queued {len(q):3}{oldest}')
-    superseded = [j for j in jobs if j['superseded']]
-    print(f'  jobs of superseded PR runs: {len(superseded)}')
+    print(f'  jobs of superseded PR runs: {sum(j["superseded"] for j in jobs)}')
+    print(f'  macOS: {snapshot["macos"]}')
     print(f'  API requests left this hour: {snapshot["rate_remaining"]}')
 
 
 def make_handler(monitor):
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
-            path = urlsplit(self.path).path
-            if path == '/':
+            url = urlsplit(self.path)
+            if url.path == '/':
                 self.send(200, 'text/html; charset=utf-8', (HERE / 'index.html').read_bytes())
-            elif path == '/api/state':
-                self.send(200, 'application/json', json.dumps(monitor.state()).encode())
-            elif path == '/metrics':
-                self.send(200, 'text/plain; version=0.0.4; charset=utf-8', monitor.metrics().encode())
+            elif url.path == '/api/state':
+                self.send_json(monitor.state())
+            elif url.path == '/api/history':
+                try:
+                    hours = float(parse_qs(url.query).get('hours', ['24'])[0])
+                except ValueError:
+                    hours = 24
+                hours = min(max(hours, 1), monitor.args.days * 24)
+                self.send_json(monitor.history(hours))
             else:
                 self.send(404, 'text/plain', b'not found')
+
+        def send_json(self, data):
+            self.send(200, 'application/json', json.dumps(data).encode())
 
         def send(self, code, content_type, body):
             self.send_response(code)
@@ -346,18 +506,20 @@ def main():
     parser.add_argument('--host', default='127.0.0.1')
     parser.add_argument('--port', type=int, default=8765)
     parser.add_argument('--interval', type=int, default=60, help='seconds between GitHub polls')
+    parser.add_argument('--days', type=int, default=14, help='how many days of history to keep')
     parser.add_argument('--total-slots', type=int, default=60, help='concurrent jobs for the org')
     parser.add_argument('--macos-slots', type=int, default=5, help='concurrent macOS jobs for the org')
-    parser.add_argument('--macos-minutes', type=int, default=35, help='average macOS job duration for estimates')
-    parser.add_argument('--history-file', default=str(HERE / 'history.jsonl'), help='where the chart history is kept')
-    parser.add_argument('--once', action='store_true', help='print one snapshot and exit')
+    parser.add_argument('--data-dir', default=str(HERE / 'data'), help='where the cache is kept')
+    parser.add_argument('--once', action='store_true', help='poll once, print a summary and exit')
     args = parser.parse_args()
 
     monitor = Monitor(args)
     if args.once:
-        print_summary(monitor.take_snapshot())
+        monitor.poll()
+        print_summary(monitor.snapshot)
         return
     threading.Thread(target=monitor.poll_forever, daemon=True).start()
+    threading.Thread(target=monitor.backfill_forever, daemon=True).start()
     server = ThreadingHTTPServer((args.host, args.port), make_handler(monitor))
     print(f'CI queue monitor on http://{args.host}:{args.port} (polling every {args.interval}s)', flush=True)
     server.serve_forever()

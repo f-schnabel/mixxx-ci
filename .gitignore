@@ -1,0 +1,8 @@
+# Local state and secrets
+.env
+history.jsonl
+__pycache__/
+
+# Rendered by deploy/install.sh
+deploy/mixxx-ci-queue.service
+deploy/grafana/dashboard-provider.yaml

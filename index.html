@@ -1,0 +1,397 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>mixxxdj CI Queue</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
+<style>
+:root {
+  color-scheme: light;
+  --bg: #eef0f3; --panel: #ffffff; --ink: #1b2029; --muted: #5d6675; --line: #d8dce3;
+  --accent: #d9661a; --run: #1f8a70; --run-soft: #dff1eb; --queue: #a86f00; --queue-soft: #fbefd3;
+  --crit: #c2413b; --crit-soft: #f8e1df; --sup: #6f63a3; --sup-soft: #ebe8f5;
+  --sans: "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --mono: "IBM Plex Mono", ui-monospace, "Cascadia Mono", Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --bg: #111419; --panel: #191d24; --ink: #e5e8ee; --muted: #97a0af; --line: #2a303a;
+    --accent: #f0873a; --run: #3cbf98; --run-soft: #173229; --queue: #e7b43a; --queue-soft: #3a2f14;
+    --crit: #e5645c; --crit-soft: #3d1d1c; --sup: #a99cd8; --sup-soft: #2a2640;
+  }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #111419; --panel: #191d24; --ink: #e5e8ee; --muted: #97a0af; --line: #2a303a;
+  --accent: #f0873a; --run: #3cbf98; --run-soft: #173229; --queue: #e7b43a; --queue-soft: #3a2f14;
+  --crit: #e5645c; --crit-soft: #3d1d1c; --sup: #a99cd8; --sup-soft: #2a2640;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--ink); font: 14px/1.45 var(--sans); }
+main { max-width: 1280px; margin: 0 auto; padding: 20px 16px 48px; display: grid; gap: 20px; }
+a { color: inherit; text-decoration-color: var(--line); text-underline-offset: 2px; }
+a:hover { color: var(--accent); text-decoration-color: currentColor; }
+a:focus-visible, button:focus-visible, input:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.num, time { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+
+header { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 8px 20px; }
+h1 { margin: 0; font-size: 22px; font-weight: 600; letter-spacing: -.01em; }
+h1 span { color: var(--accent); }
+.status { display: flex; flex-wrap: wrap; gap: 6px 16px; color: var(--muted); font: 12px var(--mono); }
+.dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--run); margin-right: 6px; vertical-align: 1px; }
+.dot.stale { background: var(--queue); } .dot.down { background: var(--crit); }
+.banner { padding: 10px 14px; border-radius: 6px; background: var(--crit-soft); color: var(--crit); font-size: 13px; }
+
+.tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; }
+.tile { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 14px 16px; display: grid; gap: 6px; align-content: start; }
+.tile h2 { margin: 0; font: 500 11px var(--mono); letter-spacing: .06em; text-transform: uppercase; color: var(--muted); }
+.big { font: 500 28px/1.1 var(--mono); font-variant-numeric: tabular-nums; }
+.big small { font-size: 15px; color: var(--muted); }
+.tile p { margin: 0; color: var(--muted); font-size: 12.5px; }
+.meter { height: 6px; border-radius: 3px; background: var(--line); overflow: hidden; display: flex; }
+.meter i { display: block; height: 100%; }
+.warn { color: var(--queue); } .bad { color: var(--crit); } .ok { color: var(--run); }
+
+.panel { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 14px 16px; }
+.panel-head { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 6px 16px; margin-bottom: 10px; }
+.panel h2 { margin: 0; font-size: 15px; font-weight: 600; }
+.chart-box { position: relative; height: 240px; }
+.empty { color: var(--muted); font-size: 13px; padding: 8px 0; }
+
+.filters { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.chip-btn { font: 500 12px var(--mono); padding: 5px 10px; border-radius: 99px; border: 1px solid var(--line); background: var(--panel); color: var(--ink); cursor: pointer; }
+.chip-btn[aria-pressed="true"] { background: var(--ink); color: var(--panel); border-color: var(--ink); }
+.check { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; color: var(--muted); cursor: pointer; margin-left: 6px; }
+
+.columns { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 480px), 1fr)); gap: 20px; align-items: start; }
+.list { list-style: none; margin: 0; padding: 0; display: grid; }
+.job { display: grid; grid-template-columns: 76px 1fr; gap: 2px 12px; padding: 9px 0; border-top: 1px solid var(--line); }
+.job:first-child { border-top: 0; }
+.job .dur { grid-row: span 2; font: 500 14px var(--mono); font-variant-numeric: tabular-nums; }
+.job .name { font-weight: 500; overflow-wrap: anywhere; }
+.job .meta { color: var(--muted); font-size: 12.5px; display: flex; flex-wrap: wrap; gap: 4px 8px; align-items: center; overflow-wrap: anywhere; }
+.job.superseded .name { text-decoration: line-through; text-decoration-color: var(--sup); }
+.chip { font: 500 10.5px var(--mono); padding: 1px 6px; border-radius: 4px; background: var(--bg); color: var(--muted); white-space: nowrap; }
+.chip.macOS { background: var(--queue-soft); color: var(--queue); }
+.chip.sup { background: var(--sup-soft); color: var(--sup); }
+.chip.mine { background: var(--accent); color: var(--panel); }
+.count { font: 12px var(--mono); color: var(--muted); }
+
+.scroll { overflow-x: auto; }
+table { border-collapse: collapse; width: 100%; font-size: 13px; }
+th, td { text-align: left; padding: 7px 10px 7px 0; border-top: 1px solid var(--line); white-space: nowrap; }
+th { font: 500 11px var(--mono); letter-spacing: .05em; text-transform: uppercase; color: var(--muted); border-top: 0; }
+td.num { text-align: right; } th.num { text-align: right; }
+footer { color: var(--muted); font-size: 12px; }
+@media (prefers-reduced-motion: no-preference) { .meter i { transition: width .4s ease; } }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1><span>mixxxdj</span> CI queue</h1>
+    <div class="status" aria-live="polite">
+      <span id="live"><span class="dot"></span>connecting</span>
+      <span id="updated"></span>
+      <span id="rate"></span>
+    </div>
+  </header>
+  <div id="error" class="banner" hidden></div>
+
+  <section class="tiles" aria-label="Summary">
+    <div class="tile"><h2>Org runners</h2><div class="big" id="t-org">–</div><div class="meter" id="m-org"></div><p id="t-org-note"></p></div>
+    <div class="tile"><h2>macOS</h2><div class="big" id="t-mac">–</div><div class="meter" id="m-mac"></div><p id="t-mac-note"></p></div>
+    <div class="tile"><h2>Oldest macOS wait</h2><div class="big" id="t-wait">–</div><p id="t-wait-note"></p></div>
+    <div class="tile"><h2>macOS backlog</h2><div class="big" id="t-drain">–</div><p id="t-drain-note"></p></div>
+  </section>
+
+  <section class="panel">
+    <div class="panel-head">
+      <h2>Queue over time</h2>
+      <span class="count">hover for values · click a legend entry to hide it</span>
+    </div>
+    <div class="chart-box"><canvas id="chart" role="img" aria-label="Queued and running jobs over time"></canvas></div>
+    <p class="empty" id="chart-empty">Collecting data, the chart fills in after a few polls.</p>
+  </section>
+
+  <div class="filters" role="group" aria-label="Filter jobs">
+    <button class="chip-btn" data-family="all" aria-pressed="true">All runners</button>
+    <button class="chip-btn" data-family="macOS" aria-pressed="false">macOS</button>
+    <button class="chip-btn" data-family="Linux" aria-pressed="false">Linux</button>
+    <button class="chip-btn" data-family="Windows" aria-pressed="false">Windows</button>
+    <label class="check"><input type="checkbox" id="only-mine"> Only my runs</label>
+    <label class="check"><input type="checkbox" id="hide-sup"> Hide superseded</label>
+  </div>
+
+  <div class="columns">
+    <section class="panel">
+      <div class="panel-head"><h2>Waiting for a runner</h2><span class="count" id="c-queued"></span></div>
+      <ul class="list" id="queued"></ul>
+    </section>
+    <section class="panel">
+      <div class="panel-head"><h2>Running</h2><span class="count" id="c-running"></span></div>
+      <ul class="list" id="running"></ul>
+    </section>
+  </div>
+
+  <section class="panel">
+    <div class="panel-head"><h2>By runner label</h2></div>
+    <div class="scroll"><table>
+      <thead><tr><th>Label</th><th class="num">Running</th><th class="num">Queued</th><th class="num">Oldest wait</th></tr></thead>
+      <tbody id="labels"></tbody>
+    </table></div>
+  </section>
+
+  <footer id="footer"></footer>
+</main>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<script>
+const POLL_MS = 15000;
+let state = null;
+let lastOk = 0;
+const prefs = { family: 'all', mine: false, hideSup: false };
+try { Object.assign(prefs, JSON.parse(localStorage.getItem('ciQueuePrefs') || '{}')); } catch {}
+
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c]);
+const since = (iso) => Date.now() - new Date(iso).getTime();
+
+function fmtDur(ms) {
+  const m = Math.max(0, Math.round(ms / 60000));
+  if (m < 1) return '<1m';
+  if (m < 60) return `${m}m`;
+  return `${Math.floor(m / 60)}h ${String(m % 60).padStart(2, '0')}m`;
+}
+
+function savePrefs() {
+  try { localStorage.setItem('ciQueuePrefs', JSON.stringify(prefs)); } catch {}
+}
+
+async function poll() {
+  try {
+    const response = await fetch('/api/state', { cache: 'no-store' });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    state = await response.json();
+    lastOk = Date.now();
+    render();
+  } catch (error) {
+    renderStatus(`Monitor not reachable (${error.message}). Is monitor.py still running?`);
+  }
+}
+
+function renderStatus(pageError) {
+  const snap = state?.snapshot;
+  const age = snap ? since(snap.taken_at) : Infinity;
+  const interval = (state?.interval ?? 60) * 1000;
+  let cls = '', label = 'live';
+  if (pageError || Date.now() - lastOk > 3 * POLL_MS) { cls = 'down'; label = 'offline'; }
+  else if (!snap) { cls = 'stale'; label = 'first poll…'; }
+  else if (age > 3 * interval) { cls = 'stale'; label = 'stale'; }
+  $('live').innerHTML = `<span class="dot ${cls}"></span>${label}`;
+  $('updated').textContent = snap ? `GitHub polled ${fmtDur(age)} ago` : '';
+  $('rate').textContent = snap?.rate_remaining ? `${snap.rate_remaining} API calls left this hour` : '';
+  const message = pageError || state?.error;
+  $('error').hidden = !message;
+  $('error').textContent = message ? `Last poll failed: ${message}` : '';
+}
+
+function meter(el, parts, total) {
+  el.innerHTML = parts.map(([n, color]) => `<i style="width:${Math.min(100, (n / total) * 100)}%;background:${color}"></i>`).join('');
+}
+
+function render() {
+  renderStatus();
+  const snap = state?.snapshot;
+  if (!snap) return;
+  const jobs = snap.jobs;
+  const running = jobs.filter((j) => j.status === 'in_progress');
+  const queued = jobs.filter((j) => j.status === 'queued');
+  const macRunning = running.filter((j) => j.family === 'macOS');
+  const macQueued = queued.filter((j) => j.family === 'macOS').sort((a, b) => a.created_at.localeCompare(b.created_at));
+  const { total, macOS: macSlots } = snap.limits;
+  const sup = jobs.filter((j) => j.superseded);
+
+  $('t-org').innerHTML = `${running.length}<small> / ${total}</small>`;
+  meter($('m-org'), [[running.length, running.length >= total ? 'var(--crit)' : 'var(--run)']], total);
+  const nonMacQueued = queued.length - macQueued.length;
+  $('t-org-note').innerHTML = nonMacQueued
+    ? `<span class="warn">${nonMacQueued} non-macOS jobs waiting</span>`
+    : 'Linux and Windows jobs start right away';
+
+  $('t-mac').innerHTML = `${macRunning.length}<small> / ${macSlots} running</small>`;
+  meter($('m-mac'), [[macRunning.length, 'var(--run)']], macSlots);
+  $('t-mac-note').innerHTML = macQueued.length
+    ? `<span class="warn">${macQueued.length} queued</span>`
+    : '<span class="ok">nothing queued</span>';
+
+  if (macQueued.length) {
+    const oldest = macQueued[0];
+    const wait = since(oldest.created_at);
+    $('t-wait').innerHTML = `<span class="${wait > 2 * 3600e3 ? 'bad' : wait > 3600e3 ? 'warn' : ''}">${fmtDur(wait)}</span>`;
+    $('t-wait-note').innerHTML = `<a href="${esc(oldest.url)}" target="_blank" rel="noopener">${esc(oldest.name.replace('build / ', ''))}</a> · ${esc(oldest.branch)}`;
+    const drain = (macQueued.length * snap.macos_minutes) / macSlots;
+    $('t-drain').textContent = `~${fmtDur(drain * 60000)}`;
+    $('t-drain-note').textContent = `${macQueued.length} jobs × ~${snap.macos_minutes} min on ${macSlots} slots, without new pushes`;
+  } else {
+    $('t-wait').textContent = '0m';
+    $('t-wait-note').textContent = 'no macOS job waiting';
+    $('t-drain').textContent = '0m';
+    $('t-drain-note').textContent = 'queue is empty';
+  }
+
+  $('footer').innerHTML = `Watching ${snap.repos.map(esc).join(', ')} · ${sup.length} unfinished jobs belong to pull request runs that already have a newer run · limits: ${total} jobs, ${macSlots} macOS (org-wide)`;
+
+  renderChart();
+  renderLists(snap);
+  renderLabels(running, queued);
+}
+
+function visible(job, me) {
+  if (prefs.family !== 'all' && job.family !== prefs.family) return false;
+  if (prefs.mine && job.actor !== me) return false;
+  if (prefs.hideSup && job.superseded) return false;
+  return true;
+}
+
+function jobItem(job, me, durationMs) {
+  const chips = [`<span class="chip ${job.family}">${esc(job.family)}</span>`];
+  if (job.superseded) chips.push('<span class="chip sup">superseded</span>');
+  if (job.actor === me) chips.push('<span class="chip mine">yours</span>');
+  if (job.repo !== 'mixxx') chips.push(`<span class="chip">${esc(job.repo)}</span>`);
+  return `<li class="job${job.superseded ? ' superseded' : ''}">
+    <span class="dur">${fmtDur(durationMs)}</span>
+    <a class="name" href="${esc(job.url)}" target="_blank" rel="noopener">${esc(job.name)}</a>
+    <span class="meta">${chips.join('')}<a href="${esc(job.run_url)}" target="_blank" rel="noopener">${esc(job.run_title)}</a><span>${esc(job.branch)}</span></span>
+  </li>`;
+}
+
+function renderLists(snap) {
+  const me = snap.me;
+  const queued = snap.jobs.filter((j) => j.status === 'queued' && visible(j, me)).sort((a, b) => a.created_at.localeCompare(b.created_at));
+  const running = snap.jobs.filter((j) => j.status === 'in_progress' && visible(j, me)).sort((a, b) => (a.started_at || '').localeCompare(b.started_at || ''));
+  $('queued').innerHTML = queued.map((j) => jobItem(j, me, since(j.created_at))).join('') || '<li class="empty">No job is waiting.</li>';
+  $('running').innerHTML = running.map((j) => jobItem(j, me, since(j.started_at || j.created_at))).join('') || '<li class="empty">Nothing running.</li>';
+  $('c-queued').textContent = `${queued.length} jobs · time waiting`;
+  $('c-running').textContent = `${running.length} jobs · time running`;
+}
+
+function renderLabels(running, queued) {
+  const rows = new Map();
+  for (const job of [...running, ...queued]) {
+    const key = job.labels.join(', ') || '(none)';
+    const row = rows.get(key) || { running: 0, queued: 0, oldest: null };
+    if (job.status === 'in_progress') row.running++;
+    else { row.queued++; if (!row.oldest || job.created_at < row.oldest) row.oldest = job.created_at; }
+    rows.set(key, row);
+  }
+  const sorted = [...rows].sort((a, b) => b[1].queued - a[1].queued || b[1].running - a[1].running);
+  $('labels').innerHTML = sorted.map(([label, r]) => `<tr>
+    <td>${esc(label)}</td><td class="num">${r.running}</td>
+    <td class="num ${r.queued ? 'warn' : ''}">${r.queued}</td>
+    <td class="num">${r.oldest ? fmtDur(since(r.oldest)) : '–'}</td></tr>`).join('');
+}
+
+let chart = null;
+const SERIES = [
+  { key: 'mac_queued', label: 'macOS queued', color: '--queue', fill: '--queue-soft' },
+  { key: 'mac_running', label: 'macOS running', color: '--sup' },
+  { key: 'running', label: 'All running', color: '--run' },
+  { key: 'queued', label: 'All queued', color: '--crit', hidden: true },
+];
+
+function chartPoints(key) {
+  // Break the line where the monitor was not running.
+  const maxGap = 3 * (state.interval ?? 60) * 1000;
+  const out = [];
+  let prev = null;
+  for (const p of state.history) {
+    const x = new Date(p.t).getTime();
+    if (prev !== null && x - prev > maxGap) out.push({ x: prev + 1, y: null });
+    out.push({ x, y: p[key] });
+    prev = x;
+  }
+  return out;
+}
+
+function renderChart() {
+  const points = state.history;
+  $('chart-empty').hidden = points.length >= 2;
+  if (typeof Chart === 'undefined') {
+    $('chart-empty').hidden = false;
+    $('chart-empty').textContent = 'Chart.js could not be loaded (offline?).';
+    return;
+  }
+  const css = getComputedStyle(document.documentElement);
+  const token = (name) => css.getPropertyValue(name).trim();
+  const multiDay = points.length > 1 && new Date(points[0].t).toDateString() !== new Date(points[points.length - 1].t).toDateString();
+  const tick = (ms) => new Date(ms).toLocaleString([], multiDay
+    ? { weekday: 'short', hour: '2-digit', minute: '2-digit' }
+    : { hour: '2-digit', minute: '2-digit' });
+  const datasets = SERIES.map((s) => ({
+    label: s.label,
+    data: chartPoints(s.key),
+    borderColor: token(s.color),
+    backgroundColor: s.fill ? token(s.fill) : token(s.color),
+    fill: Boolean(s.fill),
+    // Lower order is drawn on top: keep the filled area behind the lines.
+    order: s.fill ? 10 : 0,
+    borderWidth: 2,
+    pointRadius: 0,
+    pointHoverRadius: 4,
+    tension: 0.2,
+    spanGaps: false,
+  }));
+  Chart.defaults.font.family = token('--mono');
+  if (!chart) {
+    chart = new Chart($('chart'), {
+      type: 'line',
+      data: { datasets: datasets.map((d, i) => ({ ...d, hidden: Boolean(SERIES[i].hidden) })) },
+      options: {
+        maintainAspectRatio: false,
+        animation: false,
+        parsing: false,
+        interaction: { mode: 'nearest', axis: 'x', intersect: false },
+        scales: {
+          x: { type: 'linear', ticks: { maxTicksLimit: 8 }, grid: { display: false } },
+          y: { beginAtZero: true, ticks: { precision: 0 } },
+        },
+        plugins: {
+          legend: { position: 'bottom', labels: { boxWidth: 14, boxHeight: 3 } },
+          tooltip: { callbacks: { title: (items) => new Date(items[0].parsed.x).toLocaleString() } },
+        },
+      },
+    });
+  } else {
+    chart.data.datasets.forEach((d, i) => Object.assign(d, { ...datasets[i], hidden: d.hidden }));
+  }
+  // Follow the page theme for text and grid colors.
+  const { x, y } = chart.options.scales;
+  x.ticks.callback = tick;
+  x.ticks.color = y.ticks.color = token('--muted');
+  y.grid.color = token('--line');
+  chart.options.plugins.legend.labels.color = token('--ink');
+  chart.update('none');
+}
+
+document.querySelectorAll('[data-family]').forEach((button) => {
+  button.addEventListener('click', () => { prefs.family = button.dataset.family; savePrefs(); syncControls(); render(); });
+});
+$('only-mine').addEventListener('change', (e) => { prefs.mine = e.target.checked; savePrefs(); render(); });
+$('hide-sup').addEventListener('change', (e) => { prefs.hideSup = e.target.checked; savePrefs(); render(); });
+
+function syncControls() {
+  document.querySelectorAll('[data-family]').forEach((b) => b.setAttribute('aria-pressed', String(b.dataset.family === prefs.family)));
+  $('only-mine').checked = prefs.mine;
+  $('hide-sup').checked = prefs.hideSup;
+}
+
+syncControls();
+poll();
+setInterval(poll, POLL_MS);
+</script>
+</body>
+</html>

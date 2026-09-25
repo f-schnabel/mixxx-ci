@@ -1,0 +1,16 @@
+[Unit]
+Description=mixxxdj CI queue monitor
+After=network-online.target
+
+[Service]
+Type=simple
+StandardOutput=journal
+StandardError=journal
+WorkingDirectory=__REPO_DIR__
+EnvironmentFile=__REPO_DIR__/.env
+ExecStart=/usr/bin/python3 __REPO_DIR__/monitor.py --host 127.0.0.1 --port 8765
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=default.target

@@ -4,7 +4,8 @@
     python monitor.py            # serve the dashboard on http://127.0.0.1:8765
     python monitor.py --once     # poll once, print a summary and exit
 
-Endpoints: / (dashboard), /api/state (current jobs), /api/history?hours=24 (chart data).
+Endpoints: / (dashboard), /api/state (current jobs), /api/history (queue chart), /api/jobs (job
+statistics), /api/job (runs of one job), /api/daily (runner hours and results per day), /api/epic.
 
 Runs and jobs are cached in SQLite. A run's jobs are only fetched again when the
 run's updated_at changes, and the chart is computed from the jobs' created,
@@ -17,6 +18,7 @@ import datetime as dt
 import json
 import math
 import os
+import re
 import sqlite3
 import statistics
 import subprocess
@@ -37,6 +39,7 @@ ACTIVE_REPO_DAYS = 7
 FAMILIES = ['macOS', 'Linux', 'Windows', 'Other']
 HISTORY_POINTS = 720
 BACKFILL_RESERVE = 1000  # API calls left for live polling while backfilling
+EPIC_ISSUE = ('mixxx', 17144)  # its pull requests are marked in the job charts
 UTC = dt.timezone.utc
 
 
@@ -102,7 +105,7 @@ class Store:
     RUN_FIELDS = ['id', 'repo', 'workflow_id', 'workflow', 'event', 'head_repo', 'head_branch', 'title', 'url',
                   'actor', 'created_at', 'updated_at', 'status']
     JOB_FIELDS = ['id', 'run_id', 'name', 'url', 'labels', 'runner_name', 'status', 'conclusion', 'created_at',
-                  'started_at', 'completed_at']
+                  'started_at', 'completed_at', 'steps']
 
     def __init__(self, path):
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -126,6 +129,10 @@ class Store:
                 -- Past days whose runs were listed completely; no new runs appear there.
                 CREATE TABLE IF NOT EXISTS listed_days (repo TEXT, day TEXT, PRIMARY KEY (repo, day));
             ''')
+            if 'steps' not in [c['name'] for c in self.db.execute('PRAGMA table_info(jobs)')]:
+                # Caches from before steps were kept: fetch all jobs again once.
+                self.db.execute('ALTER TABLE jobs ADD COLUMN steps TEXT')
+                self.db.execute('UPDATE runs SET jobs_synced = NULL')
 
     def save_runs(self, repo, runs):
         rows = [(
@@ -145,6 +152,7 @@ class Store:
             job['id'], run_id, job['name'], job['html_url'], json.dumps(job['labels']), job['runner_name'],
             job['status'],
             job['conclusion'], job['created_at'], job['started_at'], job['completed_at'],
+            json.dumps([[s['name'], s['started_at'], s['completed_at'], s['conclusion']] for s in job.get('steps') or []]),
         ) for job in jobs]
         with self.lock, self.db:
             self.db.executemany(f'INSERT OR REPLACE INTO jobs VALUES ({", ".join("?" * len(self.JOB_FIELDS))})', rows)
@@ -215,6 +223,8 @@ class Monitor:
         self.history_cache = {}
         self.error = None
         self.backfill_status = 'waiting'
+        self.epic_prs = []
+        self.epic_checked = 0.0
         self.lock = threading.Lock()
 
     def window_start(self):
@@ -262,7 +272,26 @@ class Monitor:
                 if run is not None:
                     self.store.save_runs(repo, [run])
             list(pool.map(self.sync_jobs, self.store.runs_needing_jobs(since, only_active=True)))
+        if time.time() - self.epic_checked > 900:
+            self.refresh_epic()
         self.rebuild()
+
+    def refresh_epic(self):
+        repo, number = EPIC_ISSUE
+        body = self.gh.get(f'/repos/{ORG}/{repo}/issues/{number}')['body'] or ''
+        prs = []
+        for n in sorted({int(n) for n in re.findall(r'#(\d+)', body)}):
+            try:
+                pr = self.gh.get(f'/repos/{ORG}/{repo}/pulls/{n}')
+            except HTTPError:
+                continue  # an issue, not a pull request
+            prs.append({
+                'number': n, 'title': pr['title'], 'url': pr['html_url'], 'base': pr['base']['ref'],
+                'state': 'merged' if pr['merged_at'] else pr['state'], 'merged_at': pr['merged_at'],
+            })
+        with self.lock:
+            self.epic_prs = prs
+            self.epic_checked = time.time()
 
     def fetch_run(self, item):
         run_id, repo = item
@@ -465,6 +494,111 @@ class Monitor:
             self.history_cache[key] = result
         return result
 
+    def finished_jobs(self, days, runs='all'):
+        """Jobs that ran and finished within the last `days`, optionally only
+        pull request runs ('pr') or pushes to one branch ('push:2.5')."""
+        with self.lock:
+            model, now, _ = self.model or ([], time.time(), 0)
+        cutoff = now - days * 86400
+        result = []
+        for m in model:
+            if not (m['started'] and m['completed'] and m['completed'] >= cutoff):
+                continue
+            run = m['run']
+            if runs == 'pr' and run['event'] != 'pull_request':
+                continue
+            if runs.startswith('push:') and (run['event'] != 'push' or run['head_branch'] != runs[5:]):
+                continue
+            result.append(m)
+        return result, now
+
+    @staticmethod
+    def minutes(m):
+        return (m['completed'] - m['started']) / 60
+
+    def job_stats(self, days, runs):
+        items, now = self.finished_jobs(days, runs)
+        groups = {}
+        for m in items:
+            groups.setdefault((m['run']['repo'], m['job']['name']), []).append(m)
+        recent_from = now - min(3, days / 2) * 86400
+        rows = []
+        for (repo, name), ms in groups.items():
+            # Cancelled jobs stop early and would pull the durations down.
+            done = [m for m in ms if m['job']['conclusion'] in ('success', 'failure')]
+            durations = sorted(self.minutes(m) for m in done)
+            recent = [self.minutes(m) for m in done if m['completed'] >= recent_from]
+            older = [self.minutes(m) for m in done if m['completed'] < recent_from]
+            conclusions = [m['job']['conclusion'] for m in ms]
+            rows.append({
+                'repo': repo, 'name': name, 'family': ms[0]['family'], 'runs': len(ms),
+                'median': round(statistics.median(durations), 1) if durations else None,
+                'p90': round(durations[int(0.9 * (len(durations) - 1))], 1) if durations else None,
+                'trend': (round(statistics.median(recent) / statistics.median(older) - 1, 3)
+                          if len(recent) >= 3 and len(older) >= 3 and statistics.median(older) > 0 else None),
+                'wait': round(statistics.median((m['started'] - m['created']) / 60 for m in ms), 1),
+                'success': conclusions.count('success'), 'failure': conclusions.count('failure'),
+                'cancelled': conclusions.count('cancelled'),
+                'runner_hours': round(sum(self.minutes(m) for m in ms) / 60, 1),
+            })
+        rows.sort(key=lambda r: -(r['median'] or 0))
+        return {'days': days, 'runs': runs, 'jobs': rows}
+
+    def job_runs(self, repo, name, days, runs):
+        items, _ = self.finished_jobs(days, runs)
+        points, steps = [], {}
+        for m in items:
+            job, run = m['job'], m['run']
+            if run['repo'] != repo or job['name'] != name:
+                continue
+            step_minutes = {}
+            for step_name, started, completed, conclusion in json.loads(job.get('steps') or '[]'):
+                if started and completed and conclusion != 'skipped':
+                    step_minutes[step_name] = round((timestamp(completed) - timestamp(started)) / 60, 2)
+            if job['conclusion'] in ('success', 'failure'):
+                for step_name, value in step_minutes.items():
+                    steps.setdefault(step_name, []).append(value)
+            points.append({
+                't': round(m['completed'] * 1000), 'minutes': round(self.minutes(m), 2),
+                'wait': round((m['started'] - m['created']) / 60, 1), 'conclusion': job['conclusion'],
+                'branch': run['head_branch'], 'event': run['event'], 'url': job['url'], 'title': run['title'],
+                'steps': step_minutes,
+            })
+        points.sort(key=lambda p: p['t'])
+        step_rows = sorted(({'name': k, 'median': round(statistics.median(v), 1), 'runs': len(v)}
+                            for k, v in steps.items()), key=lambda r: -r['median'])
+        return {'repo': repo, 'name': name, 'points': points, 'steps': step_rows}
+
+    def daily(self, days):
+        items, now = self.finished_jobs(days)
+        by_day = {}
+        for m in items:
+            day = by_day.setdefault(iso_date(m['completed']), {
+                'hours': {f: 0.0 for f in FAMILIES}, 'superseded_hours': 0.0, 'cancelled_hours': 0.0,
+                'success': 0, 'failure': 0, 'cancelled': 0})
+            hours = self.minutes(m) / 60
+            day['hours'][m['family']] += hours
+            if m['superseded_since'] is not None:
+                day['superseded_hours'] += max(0.0, m['completed'] - max(m['started'], m['superseded_since'])) / 3600
+            conclusion = m['job']['conclusion']
+            if conclusion == 'cancelled':
+                day['cancelled_hours'] += hours
+            if conclusion in ('success', 'failure', 'cancelled'):
+                day[conclusion] += 1
+        result = []
+        for key in sorted(by_day):
+            d = by_day[key]
+            result.append({'day': key, **{k: v for k, v in d.items() if k != 'hours'},
+                           'hours': {f: round(h, 1) for f, h in d['hours'].items()},
+                           'superseded_hours': round(d['superseded_hours'], 1),
+                           'cancelled_hours': round(d['cancelled_hours'], 1)})
+        return {'days': days, 'per_day': result}
+
+    def epic(self):
+        with self.lock:
+            return {'issue': f'https://github.com/{ORG}/{EPIC_ISSUE[0]}/issues/{EPIC_ISSUE[1]}',
+                    'prs': self.epic_prs}
+
     def poll_forever(self):
         while True:
             try:
@@ -519,6 +653,21 @@ def make_handler(monitor):
                     hours = 24
                 hours = min(max(hours, 1), monitor.args.days * 24)
                 self.send_json(monitor.history(hours))
+            elif url.path in ('/api/jobs', '/api/job', '/api/daily'):
+                query = {k: v[0] for k, v in parse_qs(url.query).items()}
+                try:
+                    days = min(max(float(query.get('days', 14)), 1), monitor.args.days)
+                except ValueError:
+                    days = monitor.args.days
+                runs = query.get('runs', 'all')
+                if url.path == '/api/jobs':
+                    self.send_json(monitor.job_stats(days, runs))
+                elif url.path == '/api/job':
+                    self.send_json(monitor.job_runs(query.get('repo', 'mixxx'), query.get('name', ''), days, runs))
+                else:
+                    self.send_json(monitor.daily(days))
+            elif url.path == '/api/epic':
+                self.send_json(monitor.epic())
             else:
                 self.send(404, 'text/plain', b'not found')
 

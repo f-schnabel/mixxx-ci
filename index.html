@@ -89,6 +89,18 @@ th, td { text-align: left; padding: 7px 10px 7px 0; border-top: 1px solid var(--
 th { font: 500 11px var(--mono); letter-spacing: .05em; text-transform: uppercase; color: var(--muted); border-top: 0; }
 td.num { text-align: right; } th.num { text-align: right; }
 footer { color: var(--muted); font-size: 12px; }
+select { font: 12px var(--mono); background: var(--panel); color: var(--ink); border: 1px solid var(--line);
+  border-radius: 6px; padding: 4px 6px; }
+.chart-box.tall { height: 300px; cursor: default; }
+tr.pick { cursor: pointer; }
+tr.pick:hover td, tr.pick:focus-visible td { background: var(--bg); }
+tr.pick[aria-selected="true"] td { background: var(--queue-soft); }
+td.name { white-space: normal; min-width: 220px; }
+.epic { list-style: none; margin: 0; padding: 0; display: grid; gap: 6px; }
+.epic li { display: flex; flex-wrap: wrap; gap: 4px 10px; align-items: baseline; font-size: 13px; }
+.chip.merged { background: var(--run-soft); color: var(--run); }
+.chip.open { background: var(--sup-soft); color: var(--sup); }
+.chip.closed { background: var(--bg); color: var(--muted); }
 @media (prefers-reduced-motion: no-preference) { .meter i { transition: width .4s ease; } }
 </style>
 </head>
@@ -158,6 +170,66 @@ footer { color: var(--muted); font-size: 12px; }
     </table></div>
   </section>
 
+  <section class="panel">
+    <div class="panel-head">
+      <h2>Job durations</h2>
+      <div class="filters">
+        <label class="check">Repository <select id="d-repo"></select></label>
+        <label class="check">Runs <select id="d-runs">
+          <option value="all">All runs</option>
+          <option value="pr">Pull requests</option>
+          <option value="push:2.5">Pushes to 2.5</option>
+          <option value="push:2.6">Pushes to 2.6</option>
+          <option value="push:main">Pushes to main</option>
+        </select></label>
+        <label class="check">Period <select id="d-days">
+          <option value="3">3 days</option>
+          <option value="7">7 days</option>
+          <option value="14">14 days</option>
+        </select></label>
+      </div>
+    </div>
+    <div class="scroll"><table>
+      <thead><tr><th>Job</th><th class="num">Runs</th><th class="num">Median</th><th class="num">p90</th>
+        <th class="num" title="Median of the last 3 days compared with the days before">Trend</th>
+        <th class="num">Median wait</th><th class="num" title="Successful out of successful and failed runs">Success</th>
+        <th class="num">Runner hours</th></tr></thead>
+      <tbody id="d-table"></tbody>
+    </table></div>
+    <p class="count">Durations count successful and failed runs; cancelled runs stop early. Click a job to see every run.</p>
+  </section>
+
+  <section class="panel" id="job-detail" hidden>
+    <div class="panel-head">
+      <h2 id="jd-title"></h2>
+      <label class="check">Show <select id="jd-step"></select></label>
+    </div>
+    <div class="chart-box tall"><canvas id="jd-chart" role="img" aria-label="Duration of every run of the selected job"></canvas></div>
+    <p class="count">Each point is one finished run; click it to open the run. Dashed lines mark when pull requests of the CI epic were merged.</p>
+    <div class="scroll"><table>
+      <thead><tr><th>Step</th><th class="num">Median</th><th class="num">Runs</th></tr></thead>
+      <tbody id="jd-steps"></tbody>
+    </table></div>
+  </section>
+
+  <div class="columns">
+    <section class="panel">
+      <div class="panel-head"><h2>Runner hours per day</h2></div>
+      <div class="chart-box tall"><canvas id="daily-hours" role="img" aria-label="Runner hours per day"></canvas></div>
+      <p class="count">By the day a job finished. The line shows hours spent on pull request runs after a newer run of the same PR had started.</p>
+    </section>
+    <section class="panel">
+      <div class="panel-head"><h2>Job results per day</h2></div>
+      <div class="chart-box tall"><canvas id="daily-results" role="img" aria-label="Job results per day"></canvas></div>
+      <p class="count">Jobs that ran, by result.</p>
+    </section>
+  </div>
+
+  <section class="panel">
+    <div class="panel-head"><h2>CI improvements epic</h2><a id="epic-link" href="#" target="_blank" rel="noopener"></a></div>
+    <ul class="epic" id="epic"></ul>
+  </section>
+
   <footer id="footer"></footer>
 </main>
 
@@ -168,7 +240,7 @@ let state = null;
 let lastOk = 0;
 let history = null;
 let zoom = null;  // { from, to } in ms while zoomed in
-const prefs = { family: 'all', mine: false, hideSup: false, hours: 24 };
+const prefs = { family: 'all', mine: false, hideSup: false, hours: 24, repo: 'mixxx', runs: 'all', days: 14, job: null, step: '' };
 try { Object.assign(prefs, JSON.parse(localStorage.getItem('ciQueuePrefs') || '{}')); } catch {}
 
 const $ = (id) => document.getElementById(id);
@@ -487,9 +559,245 @@ function syncControls() {
   $('hide-sup').checked = prefs.hideSup;
 }
 
+// ---- Job durations, per-day charts and the CI epic ----
+
+let durations = null;
+let jobDetail = null;
+let epic = { prs: [] };
+let jobChart = null;
+let hoursChart = null;
+let resultsChart = null;
+
+function token(name) {
+  return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+}
+
+function fmtMin(minutes) {
+  if (minutes == null) return '–';
+  if (minutes < 1) return `${Math.round(minutes * 60)}s`;
+  return minutes < 60 ? `${minutes.toFixed(minutes < 10 ? 1 : 0)}m` : fmtDur(minutes * 60000);
+}
+
+async function getJson(url) {
+  const response = await fetch(url, { cache: 'no-store' });
+  if (!response.ok) throw new Error(`HTTP ${response.status}`);
+  return response.json();
+}
+
+async function loadDurations() {
+  try {
+    durations = await getJson(`/api/jobs?days=${prefs.days}&runs=${encodeURIComponent(prefs.runs)}`);
+    renderDurations();
+    if (prefs.job) loadJobDetail();
+  } catch (error) {
+    $('d-table').innerHTML = `<tr><td colspan="8" class="empty">Could not load job statistics (${esc(error.message)}).</td></tr>`;
+  }
+}
+
+function renderDurations() {
+  const repos = [...new Set(durations.jobs.map((j) => j.repo))].sort();
+  if (!repos.includes(prefs.repo) && repos.length) prefs.repo = repos.includes('mixxx') ? 'mixxx' : repos[0];
+  $('d-repo').innerHTML = repos.map((r) => `<option${r === prefs.repo ? ' selected' : ''}>${esc(r)}</option>`).join('');
+  const rows = durations.jobs.filter((j) => j.repo === prefs.repo);
+  $('d-table').innerHTML = rows.map((j) => {
+    const trend = j.trend == null ? '–' : `${j.trend > 0 ? '+' : ''}${Math.round(j.trend * 100)}%`;
+    const trendClass = j.trend == null ? '' : j.trend <= -0.1 ? 'ok' : j.trend >= 0.1 ? 'warn' : '';
+    const decided = j.success + j.failure;
+    const rate = decided ? Math.round((j.success / decided) * 100) : null;
+    const selected = prefs.job === j.name;
+    return `<tr class="pick" tabindex="0" data-name="${esc(j.name)}" aria-selected="${selected}">
+      <td class="name">${esc(j.name)} <span class="chip ${j.family}">${esc(j.family)}</span></td>
+      <td class="num">${j.runs}</td><td class="num">${fmtMin(j.median)}</td><td class="num">${fmtMin(j.p90)}</td>
+      <td class="num ${trendClass}">${trend}</td><td class="num">${fmtMin(j.wait)}</td>
+      <td class="num ${rate != null && rate < 80 ? 'warn' : ''}" title="${j.success} successful, ${j.failure} failed, ${j.cancelled} cancelled">${rate == null ? '–' : rate + '%'}</td>
+      <td class="num">${j.runner_hours.toFixed(1)}</td></tr>`;
+  }).join('') || '<tr><td colspan="8" class="empty">No finished jobs in this period.</td></tr>';
+}
+
+function selectJob(name) {
+  prefs.job = name;
+  prefs.step = '';
+  savePrefs();
+  renderDurations();
+  loadJobDetail();
+  $('job-detail').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+
+$('d-table').addEventListener('click', (e) => { const row = e.target.closest('tr[data-name]'); if (row) selectJob(row.dataset.name); });
+$('d-table').addEventListener('keydown', (e) => {
+  const row = e.target.closest('tr[data-name]');
+  if (row && (e.key === 'Enter' || e.key === ' ')) { e.preventDefault(); selectJob(row.dataset.name); }
+});
+$('d-repo').addEventListener('change', (e) => { prefs.repo = e.target.value; prefs.job = null; savePrefs(); $('job-detail').hidden = true; renderDurations(); });
+$('d-runs').addEventListener('change', (e) => { prefs.runs = e.target.value; savePrefs(); loadDurations(); });
+$('d-days').addEventListener('change', (e) => { prefs.days = Number(e.target.value); savePrefs(); loadDurations(); loadDaily(); });
+$('jd-step').addEventListener('change', (e) => { prefs.step = e.target.value; savePrefs(); renderJobChart(); });
+
+async function loadJobDetail() {
+  try {
+    const query = `repo=${encodeURIComponent(prefs.repo)}&name=${encodeURIComponent(prefs.job)}&days=${prefs.days}&runs=${encodeURIComponent(prefs.runs)}`;
+    jobDetail = await getJson(`/api/job?${query}`);
+  } catch (error) {
+    return;
+  }
+  $('job-detail').hidden = false;
+  $('jd-title').textContent = jobDetail.name;
+  const steps = jobDetail.steps.filter((s) => s.median >= 0.5);
+  if (prefs.step && !steps.some((s) => s.name === prefs.step)) prefs.step = '';
+  $('jd-step').innerHTML = `<option value="">Whole job</option>` +
+    steps.map((s) => `<option value="${esc(s.name)}"${s.name === prefs.step ? ' selected' : ''}>Step: ${esc(s.name)}</option>`).join('');
+  $('jd-steps').innerHTML = steps.map((s) => `<tr><td>${esc(s.name)}</td><td class="num">${fmtMin(s.median)}</td><td class="num">${s.runs}</td></tr>`).join('')
+    || '<tr><td colspan="3" class="empty">No step times recorded.</td></tr>';
+  renderJobChart();
+}
+
+// Draws a dashed vertical line with a label for every merged epic pull request.
+const epicMarkers = {
+  id: 'epicMarkers',
+  afterDatasetsDraw(chartInstance) {
+    const { ctx, chartArea: area, scales: { x } } = chartInstance;
+    ctx.save();
+    ctx.font = `11px ${token('--mono')}`;
+    ctx.fillStyle = ctx.strokeStyle = token('--accent');
+    ctx.setLineDash([4, 4]);
+    let labelRow = 0;
+    for (const pr of epic.prs) {
+      if (!pr.merged_at) continue;
+      const px = x.getPixelForValue(new Date(pr.merged_at).getTime());
+      if (px < area.left || px > area.right) continue;
+      ctx.beginPath();
+      ctx.moveTo(px, area.top);
+      ctx.lineTo(px, area.bottom);
+      ctx.stroke();
+      const label = `#${pr.number} → ${pr.base}`;
+      const width = ctx.measureText(label).width;
+      ctx.fillText(label, Math.min(px + 4, area.right - width), area.top + 12 + 13 * (labelRow++ % 4));
+    }
+    ctx.restore();
+  },
+};
+
+function timeTicks(values) {
+  const spanDays = values.length ? (Math.max(...values) - Math.min(...values)) / 86400e3 : 0;
+  return (ms) => new Date(ms).toLocaleString([], spanDays > 1
+    ? { weekday: 'short', day: 'numeric', hour: '2-digit' }
+    : { hour: '2-digit', minute: '2-digit' });
+}
+
+function renderJobChart() {
+  if (!jobDetail || typeof Chart === 'undefined') return;
+  const value = (p) => (prefs.step ? p.steps[prefs.step] : p.minutes);
+  const groups = [
+    { key: 'success', label: 'Success', color: '--run' },
+    { key: 'failure', label: 'Failure', color: '--crit' },
+    { key: 'cancelled', label: 'Cancelled', color: '--muted' },
+  ];
+  const datasets = groups.map((g) => ({
+    label: g.label,
+    data: jobDetail.points.filter((p) => p.conclusion === g.key && value(p) != null).map((p) => ({ x: p.t, y: value(p), p })),
+    backgroundColor: token(g.color),
+    borderColor: token(g.color),
+    pointRadius: 3,
+    pointHoverRadius: 5,
+  }));
+  const ticks = timeTicks(jobDetail.points.map((p) => p.t));
+  const options = {
+    maintainAspectRatio: false,
+    animation: false,
+    parsing: false,
+    scales: {
+      x: { type: 'linear', ticks: { maxTicksLimit: 8, callback: ticks, color: token('--muted') }, grid: { display: false },
+           min: jobDetail.points[0]?.t, max: Date.now() },
+      y: { beginAtZero: true, title: { display: true, text: 'minutes', color: token('--muted') },
+           ticks: { color: token('--muted') }, grid: { color: token('--line') } },
+    },
+    plugins: {
+      legend: { position: 'bottom', labels: { color: token('--ink'), boxWidth: 10 } },
+      tooltip: { callbacks: {
+        title: (items) => new Date(items[0].raw.x).toLocaleString(),
+        label: (item) => `${fmtMin(item.raw.y)} · ${item.raw.p.branch} · ${item.raw.p.title}`,
+        afterLabel: (item) => `waited ${fmtMin(item.raw.p.wait)} for a runner`,
+      } },
+    },
+    onClick: (event, elements) => {
+      const hit = elements[0];
+      if (hit) window.open(jobChart.data.datasets[hit.datasetIndex].data[hit.index].p.url, '_blank', 'noopener');
+    },
+  };
+  if (jobChart) jobChart.destroy();
+  jobChart = new Chart($('jd-chart'), { type: 'scatter', data: { datasets }, options, plugins: [epicMarkers] });
+}
+
+async function loadDaily() {
+  let data;
+  try {
+    data = await getJson(`/api/daily?days=${prefs.days}`);
+  } catch (error) {
+    return;
+  }
+  if (typeof Chart === 'undefined') return;
+  const days = data.per_day;
+  const labels = days.map((d) => new Date(`${d.day}T12:00:00Z`).toLocaleDateString([], { weekday: 'short', day: 'numeric' }));
+  const base = (stacked) => ({
+    maintainAspectRatio: false,
+    animation: false,
+    interaction: { mode: 'index', intersect: false },
+    scales: {
+      x: { stacked, ticks: { color: token('--muted') }, grid: { display: false } },
+      y: { stacked, beginAtZero: true, ticks: { color: token('--muted') }, grid: { color: token('--line') } },
+    },
+    plugins: { legend: { position: 'bottom', labels: { color: token('--ink'), boxWidth: 10 } } },
+  });
+  const families = [['macOS', '--queue'], ['Linux', '--run'], ['Windows', '--sup'], ['Other', '--muted']];
+  const hoursData = {
+    labels,
+    datasets: [
+      ...families.map(([f, color]) => ({ type: 'bar', label: `${f} hours`, data: days.map((d) => d.hours[f]), backgroundColor: token(color), stack: 'hours' })),
+      { type: 'line', label: 'On superseded runs', data: days.map((d) => d.superseded_hours), borderColor: token('--crit'),
+        backgroundColor: token('--crit'), borderWidth: 2, pointRadius: 3, order: -1 },
+    ],
+  };
+  const resultsData = {
+    labels,
+    datasets: [['success', 'Success', '--run'], ['failure', 'Failure', '--crit'], ['cancelled', 'Cancelled', '--muted']]
+      .map(([key, label, color]) => ({ label, data: days.map((d) => d[key]), backgroundColor: token(color) })),
+  };
+  if (hoursChart) hoursChart.destroy();
+  if (resultsChart) resultsChart.destroy();
+  const hoursOptions = base(true);
+  hoursOptions.scales.y.title = { display: true, text: 'runner hours', color: token('--muted') };
+  hoursChart = new Chart($('daily-hours'), { data: hoursData, options: hoursOptions });
+  resultsChart = new Chart($('daily-results'), { type: 'bar', data: resultsData, options: base(true) });
+}
+
+async function loadEpic() {
+  try {
+    epic = await getJson('/api/epic');
+  } catch (error) {
+    return;
+  }
+  $('epic-link').href = epic.issue;
+  $('epic-link').textContent = `#${epic.issue.split('/').pop()}`;
+  $('epic').innerHTML = epic.prs.map((pr) => `<li>
+      <span class="chip ${pr.state}">${pr.state}${pr.merged_at ? ' ' + new Date(pr.merged_at).toLocaleDateString() : ''}</span>
+      <a href="${esc(pr.url)}" target="_blank" rel="noopener">#${pr.number}</a>
+      <span>${esc(pr.title)}</span><span class="chip">→ ${esc(pr.base)}</span></li>`).join('')
+    || '<li class="empty">The epic lists no pull requests yet.</li>';
+  if (jobChart) jobChart.update('none');
+}
+
+function syncDurationControls() {
+  $('d-runs').value = prefs.runs;
+  $('d-days').value = String(prefs.days);
+}
+
 syncControls();
+syncDurationControls();
 poll();
 setInterval(poll, POLL_MS);
+loadEpic().then(loadDurations);
+loadDaily();
+setInterval(() => { loadDurations(); loadDaily(); loadEpic(); }, 5 * 60000);
 </script>
 </body>
 </html>

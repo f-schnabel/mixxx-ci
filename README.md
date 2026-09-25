@@ -22,22 +22,20 @@ Set `GITHUB_TOKEN` to use a token instead of the GitHub CLI. Chart history is ke
 
 ## Deploy on the VPS
 
-1. Create a DNS record for `mixxx-ci.schnabel.dev` pointing to the VPS.
+Every push to `main` is checked and then deployed by `.github/workflows/deploy.yml`: it connects to the VPS
+over SSH, clones or pulls the repo into `~/mixxx-ci` and runs `deploy/install.sh`. That script sets up the
+`mixxx-ci-queue` user service, links `deploy/mixxx-ci.caddyfile` into `/etc/caddy` (serving
+https://mixxx-ci.schnabel.dev) and provisions the dashboard into the Grafana folder "Mixxx".
+
+Setup, once:
+
+1. Add the repository secrets `OCI_HOST` and `OCI_PRIVATE_KEY` (SSH key of the `ubuntu` user), then run the
+   workflow.
 2. Create a [fine-grained token](https://github.com/settings/personal-access-tokens/new) with public
-   repository access and no permissions. It only raises the rate limit; the monitor uses about 2500 of
-   the 5000 requests per hour.
-3. On the VPS:
-
-   ```sh
-   git clone <this repo> ~/ci-queue && cd ~/ci-queue
-   cp .env.example .env    # fill in GITHUB_TOKEN
-   ./deploy/install.sh
-   ```
-
-4. Add the scrape job from `deploy/prometheus-scrape.yml` to `prometheus.yml` and restart Prometheus.
-
-`install.sh` sets up the `mixxx-ci-queue` user service, links `deploy/mixxx-ci.caddyfile` into `/etc/caddy`
-and provisions the dashboard into the Grafana folder "Mixxx". Run it again after pulling changes.
+   repository access and no permissions. It only raises the rate limit; the monitor uses about 2500 of the
+   5000 requests per hour. Put it into `~/mixxx-ci/.env` on the VPS (the first deploy creates the file) and
+   run `systemctl --user restart mixxx-ci-queue`.
+3. Add the scrape job from `deploy/prometheus-scrape.yml` to `prometheus.yml` and restart Prometheus.
 
 ```sh
 systemctl --user status mixxx-ci-queue

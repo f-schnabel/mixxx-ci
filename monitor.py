@@ -48,7 +48,10 @@ def github_token():
     token = os.environ.get('GITHUB_TOKEN', '').strip()
     if token:
         return token
-    result = subprocess.run(['gh', 'auth', 'token'], capture_output=True, text=True, check=True)
+    try:
+        result = subprocess.run(['gh', 'auth', 'token'], capture_output=True, text=True, check=True)
+    except (OSError, subprocess.CalledProcessError):
+        raise SystemExit('Set GITHUB_TOKEN or log in with the GitHub CLI (gh auth login).') from None
     return result.stdout.strip()
 
 

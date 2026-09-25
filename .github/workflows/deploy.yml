@@ -1,0 +1,48 @@
+name: Check and deploy
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Check Python
+        run: python3 -m py_compile monitor.py deploy/grafana/build_dashboard.py
+      - name: Check install script
+        run: bash -n deploy/install.sh
+      - name: Check that the dashboard JSON is up to date
+        run: |
+          python3 deploy/grafana/build_dashboard.py
+          git diff --exit-code deploy/grafana/dashboards
+
+  deploy:
+    needs: check
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy to the VPS
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.OCI_HOST }}
+          username: ubuntu
+          key: ${{ secrets.OCI_PRIVATE_KEY }}
+          script: |
+            set -e
+            if [ ! -d ~/mixxx-ci ]; then
+              git clone https://github.com/${{ github.repository }}.git ~/mixxx-ci
+            fi
+            cd ~/mixxx-ci
+            git pull --ff-only
+            ./deploy/install.sh

@@ -370,6 +370,11 @@ function renderChart() {
   }
   // Follow the page theme for text and grid colors.
   const { x, y } = chart.options.scales;
+  // Start and end the axis at the data instead of at rounded tick values.
+  if (points.length) {
+    x.min = new Date(points[0].t).getTime();
+    x.max = new Date(points[points.length - 1].t).getTime();
+  }
   x.ticks.callback = tick;
   x.ticks.color = y.ticks.color = token('--muted');
   y.grid.color = token('--line');

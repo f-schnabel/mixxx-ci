@@ -123,6 +123,8 @@ class Store:
                     status TEXT, conclusion TEXT, created_at TEXT, started_at TEXT, completed_at TEXT
                 );
                 CREATE INDEX IF NOT EXISTS jobs_run ON jobs (run_id);
+                -- Past days whose runs were listed completely; no new runs appear there.
+                CREATE TABLE IF NOT EXISTS listed_days (repo TEXT, day TEXT, PRIMARY KEY (repo, day));
             ''')
 
     def save_runs(self, repo, runs):
@@ -147,6 +149,14 @@ class Store:
         with self.lock, self.db:
             self.db.executemany(f'INSERT OR REPLACE INTO jobs VALUES ({", ".join("?" * len(self.JOB_FIELDS))})', rows)
             self.db.execute('UPDATE runs SET jobs_synced = ? WHERE id = ?', (synced_at, run_id))
+
+    def listed_days(self):
+        with self.lock:
+            return {(r['repo'], r['day']) for r in self.db.execute('SELECT repo, day FROM listed_days')}
+
+    def mark_listed(self, repo, day):
+        with self.lock, self.db:
+            self.db.execute('INSERT OR IGNORE INTO listed_days VALUES (?, ?)', (repo, day))
 
     def active_runs(self):
         with self.lock:
@@ -267,25 +277,20 @@ class Monitor:
     def backfill_forever(self):
         """Fills the cache with the runs of the last days, then keeps catching up
         on runs that finished between two polls."""
-        listed = False
         while True:
             try:
                 start = self.window_start()
-                if not listed:
-                    for repo in self.watched_repos(self.args.days):
-                        day = start
-                        while day < time.time() + 86400:
-                            self.list_runs_of_day(repo, iso_date(day))
-                            day += 86400
-                    listed = True
+                today = iso_date(time.time())
+                done = self.store.listed_days()
+                days = [iso_date(start + i * 86400) for i in range(self.args.days + 1)]
+                todo = [(repo, day) for repo in self.watched_repos(self.args.days) for day in days
+                        if day <= today and (repo, day) not in done]
+                self.backfill_status = f'listing runs of {len(todo)} repository days'
+                self.in_batches(self.list_runs_of_day, todo)
                 since = dt.datetime.fromtimestamp(start, UTC).isoformat()
-                todo = self.store.runs_needing_jobs(since)
-                for i, run in enumerate(todo):
-                    self.backfill_status = f'fetching jobs of {len(todo) - i} runs'
-                    self.gh.wait_for_budget(BACKFILL_RESERVE)
-                    self.sync_jobs(run)
-                    if i % 50 == 49:
-                        self.rebuild()
+                runs = self.store.runs_needing_jobs(since)
+                self.backfill_status = f'fetching jobs of {len(runs)} runs'
+                self.in_batches(self.sync_jobs, runs, rebuild=True)
                 self.store.prune(since)
                 self.backfill_status = 'complete'
                 self.rebuild()
@@ -293,18 +298,29 @@ class Monitor:
                 self.backfill_status = f'retrying after {type(error).__name__}: {error}'
             time.sleep(60)
 
-    def list_runs_of_day(self, repo, day):
+    def in_batches(self, work, items, rebuild=False, size=40):
+        with ThreadPoolExecutor(8) as pool:
+            for i in range(0, len(items), size):
+                self.gh.wait_for_budget(BACKFILL_RESERVE)
+                list(pool.map(work, items[i:i + size]))
+                if rebuild:
+                    self.backfill_status = f'fetching jobs of {max(0, len(items) - i - size)} runs'
+                    if i % (5 * size) == 0:
+                        self.rebuild()
+
+    def list_runs_of_day(self, item):
         # The runs API returns at most 1000 results per query, so list one day at a time.
+        repo, day = item
         page = 1
         while True:
-            self.backfill_status = f'listing {repo} runs of {day}'
-            self.gh.wait_for_budget(BACKFILL_RESERVE)
             runs = self.gh.get(
                 f'/repos/{ORG}/{repo}/actions/runs?created={day}&per_page=100&page={page}')['workflow_runs']
             self.store.save_runs(repo, runs)
             if len(runs) < 100:
-                return
+                break
             page += 1
+        if day < iso_date(time.time()):
+            self.store.mark_listed(repo, day)
 
     def rebuild(self):
         """Recomputes the current state from the cache."""

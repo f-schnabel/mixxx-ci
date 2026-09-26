@@ -203,10 +203,16 @@ td.name { white-space: normal; min-width: 220px; }
   <section class="panel" id="job-detail" hidden>
     <div class="panel-head">
       <h2 id="jd-title"></h2>
-      <label class="check">Show <select id="jd-step"></select></label>
+      <div class="filters">
+        <label class="check">Show <select id="jd-step"></select></label>
+        <label class="check">Scale <select id="jd-scale">
+          <option value="shared">Same for all jobs (0–2 h)</option>
+          <option value="fit">Fit to this job</option>
+        </select></label>
+      </div>
     </div>
     <div class="chart-box tall"><canvas id="jd-chart" role="img" aria-label="Duration of every run of the selected job"></canvas></div>
-    <p class="count">Each point is one finished run; click it to open the run. Dashed lines mark when pull requests of the CI epic were merged.</p>
+    <p class="count">Each point is one finished run; click it to open the run. Triangles at the top edge are above the scale. Dashed lines mark when pull requests of the CI epic were merged.</p>
     <div class="scroll"><table>
       <thead><tr><th>Step</th><th class="num">Median</th><th class="num">Runs</th></tr></thead>
       <tbody id="jd-steps"></tbody>
@@ -241,7 +247,7 @@ let state = null;
 let lastOk = 0;
 let history = null;
 let zoom = null;  // { from, to } in ms while zoomed in
-const prefs = { family: 'all', mine: false, hideSup: false, hours: 24, repo: 'mixxx', runs: 'all', days: 14, job: null, step: '' };
+const prefs = { family: 'all', mine: false, hideSup: false, hours: 24, repo: 'mixxx', runs: 'all', days: 14, job: null, step: '', scale: 'shared' };
 try { Object.assign(prefs, JSON.parse(localStorage.getItem('ciQueuePrefs') || '{}')); } catch {}
 
 const $ = (id) => document.getElementById(id);
@@ -637,6 +643,7 @@ $('d-repo').addEventListener('change', (e) => { prefs.repo = e.target.value; pre
 $('d-runs').addEventListener('change', (e) => { prefs.runs = e.target.value; savePrefs(); loadDurations(); });
 $('d-days').addEventListener('change', (e) => { prefs.days = Number(e.target.value); savePrefs(); loadDurations(); loadDaily(); });
 $('jd-step').addEventListener('change', (e) => { prefs.step = e.target.value; savePrefs(); renderJobChart(); });
+$('jd-scale').addEventListener('change', (e) => { prefs.scale = e.target.value; savePrefs(); renderJobChart(); });
 
 async function loadJobDetail() {
   try {
@@ -689,9 +696,31 @@ function timeTicks(values) {
     : { hour: '2-digit', minute: '2-digit' });
 }
 
+// Round axis maxima in minutes, and a matching tick spacing for each.
+const SCALE_STEPS = [[5, 1], [10, 2], [15, 5], [30, 5], [60, 10], [90, 15], [120, 15], [180, 30], [240, 30], [360, 60], [480, 60]];
+const SHARED_SCALE_MINUTES = 120;
+
+function scaleFor(values) {
+  // Ignore rare outliers such as runs that hung until the 6 h timeout.
+  const sorted = [...values].sort((a, b) => a - b);
+  const p95 = sorted.length ? sorted[Math.floor(0.95 * (sorted.length - 1))] : 0;
+  return SCALE_STEPS.find(([max]) => max >= p95 * 1.1) || SCALE_STEPS[SCALE_STEPS.length - 1];
+}
+
+function axisLabel(minutes) {
+  if (minutes < 60) return `${minutes}m`;
+  const rest = minutes % 60;
+  return rest ? `${Math.floor(minutes / 60)}h ${rest}m` : `${minutes / 60}h`;
+}
+
 function renderJobChart() {
   if (!jobDetail || typeof Chart === 'undefined') return;
+  $('jd-scale').value = prefs.scale;
   const value = (p) => (prefs.step ? p.steps[prefs.step] : p.minutes);
+  const values = jobDetail.points.filter((p) => p.conclusion !== 'cancelled').map(value).filter((v) => v != null);
+  const [max, stepSize] = prefs.scale === 'shared'
+    ? SCALE_STEPS.find(([m]) => m === SHARED_SCALE_MINUTES)
+    : scaleFor(values);
   const groups = [
     { key: 'success', label: 'Success', color: '--run' },
     { key: 'failure', label: 'Failure', color: '--crit' },
@@ -699,11 +728,14 @@ function renderJobChart() {
   ];
   const datasets = groups.map((g) => ({
     label: g.label,
-    data: jobDetail.points.filter((p) => p.conclusion === g.key && value(p) != null).map((p) => ({ x: p.t, y: value(p), p })),
+    data: jobDetail.points.filter((p) => p.conclusion === g.key && value(p) != null)
+      .map((p) => ({ x: p.t, y: Math.min(value(p), max), v: value(p), p })),
     backgroundColor: token(g.color),
     borderColor: token(g.color),
-    pointRadius: 3,
-    pointHoverRadius: 5,
+    pointStyle: (ctx) => (ctx.raw && ctx.raw.v > max ? 'triangle' : 'circle'),
+    pointRadius: (ctx) => (ctx.raw && ctx.raw.v > max ? 5 : 3),
+    pointHoverRadius: 6,
+    clip: false,
   }));
   const ticks = timeTicks(jobDetail.points.map((p) => p.t));
   const options = {
@@ -713,14 +745,14 @@ function renderJobChart() {
     scales: {
       x: { type: 'linear', ticks: { maxTicksLimit: 8, callback: ticks, color: token('--muted') }, grid: { display: false },
            min: jobDetail.points[0]?.t, max: Date.now() },
-      y: { beginAtZero: true, title: { display: true, text: 'minutes', color: token('--muted') },
-           ticks: { color: token('--muted') }, grid: { color: token('--line') } },
+      y: { min: 0, max, ticks: { stepSize, color: token('--muted'), callback: (m) => axisLabel(m) },
+           grid: { color: (ctx) => (ctx.tick.value > 0 && ctx.tick.value % 60 === 0 ? token('--muted') : token('--line')) } },
     },
     plugins: {
       legend: { position: 'bottom', labels: { color: token('--ink'), boxWidth: 10 } },
       tooltip: { callbacks: {
         title: (items) => new Date(items[0].raw.x).toLocaleString(),
-        label: (item) => `${fmtMin(item.raw.y)} · ${item.raw.p.branch} · ${item.raw.p.title}`,
+        label: (item) => `${fmtMin(item.raw.v)} · ${item.raw.p.branch} · ${item.raw.p.title}`,
         afterLabel: (item) => `waited ${fmtMin(item.raw.p.wait)} for a runner`,
       } },
     },

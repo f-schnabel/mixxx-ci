@@ -11,8 +11,9 @@ regularly wait for hours.
 - `/api/state`: the current jobs as JSON
 - `/api/history?hours=24`: the chart data
 
-Runs and jobs are cached in `data/cache.sqlite`. A run's jobs are only fetched again when the run's
-`updated_at` changes, so finished runs cost one request. The chart is computed from the jobs' created,
+Runs and jobs are cached in `data/cache.sqlite`. The jobs of unfinished runs are fetched on every poll; a
+finished run's jobs are only fetched again when the run's `updated_at` changes, so finished runs cost one
+request. The chart is computed from the jobs' created,
 started and completed times. On the first start a background thread fills the cache with the runs of the last
 14 days, keeping 1000 requests per hour for the live polling.
 

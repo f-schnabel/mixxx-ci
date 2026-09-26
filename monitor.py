@@ -7,8 +7,8 @@
 Endpoints: / (dashboard), /api/state (current jobs), /api/history (queue chart), /api/jobs (job
 statistics), /api/job (runs of one job), /api/daily (runner hours and results per day), /api/epic.
 
-Runs and jobs are cached in SQLite. A run's jobs are only fetched again when the
-run's updated_at changes, and the chart is computed from the jobs' created,
+Runs and jobs are cached in SQLite. The jobs of a finished run are only fetched
+again when the run's updated_at changes, and the chart is computed from the jobs' created,
 started and completed times, so it also covers the days before the monitor ran.
 Uses $GITHUB_TOKEN, or the token of the logged-in GitHub CLI (`gh auth token`).
 """
@@ -171,12 +171,18 @@ class Store:
             return [(r['id'], r['repo']) for r in self.db.execute("SELECT id, repo FROM runs WHERE status != 'completed'")]
 
     def runs_needing_jobs(self, since, only_active=False):
-        """Runs whose jobs changed since they were last fetched, newest first."""
-        query = ('SELECT id, repo, updated_at FROM runs WHERE created_at >= ? '
-                 'AND (jobs_synced IS NULL OR jobs_synced != updated_at)')
+        """Runs whose jobs may have changed since they were last fetched, newest first.
+
+        A run's updated_at does not change when its jobs start or finish, only
+        when the run itself does, so the jobs of unfinished runs are always due.
+        """
         if only_active:
             # Finished runs seen for the first time are left to the backfill thread.
-            query += " AND (status != 'completed' OR jobs_synced IS NOT NULL)"
+            query = ("SELECT id, repo, updated_at FROM runs WHERE created_at >= ? AND (status != 'completed' "
+                     'OR (jobs_synced IS NOT NULL AND jobs_synced != updated_at))')
+        else:
+            query = ("SELECT id, repo, updated_at FROM runs WHERE created_at >= ? AND (status != 'completed' "
+                     'OR jobs_synced IS NULL OR jobs_synced != updated_at)')
         with self.lock:
             return [tuple(r) for r in self.db.execute(query + ' ORDER BY created_at DESC', (since,))]
 

@@ -368,12 +368,15 @@ function renderBacklog(snap, queued, slots) {
     $('t-drain-note').textContent = 'no finished macOS jobs in the last 24 h yet';
     return;
   }
+  // Drain at full capacity, not at the observed finish rate: that one is low whenever
+  // the runners sat idle in the window, which made a 1-job queue look like hours of work.
+  const capacity = slots * 60 / minutes;
   const rate = `${added} new vs ${finished} finished per hour (last 6 h)`;
-  if (added >= finished) {
+  if (added >= capacity) {
     $('t-drain').innerHTML = '<span class="bad">not shrinking</span>';
     $('t-drain-note').textContent = `${rate}; ~${fmtDur((queued * minutes / slots) * 60000)} if nothing new arrives`;
   } else {
-    const hours = queued / (finished - added);
+    const hours = queued / (capacity - added);
     $('t-drain').textContent = `~${fmtDur(hours * 3600e3)}`;
     $('t-drain-note').textContent = `${rate}, jobs take ~${minutes} min`;
   }
